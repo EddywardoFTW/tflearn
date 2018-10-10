@@ -19,11 +19,11 @@ from tflearn.layers.estimator import *
 # Load CIFAR-10 Dataset
 from tflearn.datasets import cifar10
 (X, Y), (X_test, Y_test) = cifar10.load_data()
-Y = to_categorical(Y, 10)
-Y_test = to_categorical(Y_test, 10)
+Y = to_categorical(Y)
+Y_test = to_categorical(Y_test)
 
 # Create DASK array using numpy arrays
-# (Note that it can works with HDF5 Dataset too)
+# (Note that it can work with HDF5 Dataset too)
 import dask.array as da
 X = da.from_array(np.asarray(X), chunks=(1000, 1000, 1000, 1000))
 Y = da.from_array(np.asarray(Y), chunks=(1000, 1000, 1000, 1000))

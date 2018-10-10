@@ -71,7 +71,8 @@ class SequenceGenerator(object):
 
     def fit(self, X_inputs, Y_targets, n_epoch=10, validation_set=None,
             show_metric=False, batch_size=None, shuffle=None,
-            snapshot_epoch=True, snapshot_step=None, run_id=None):
+            snapshot_epoch=True, snapshot_step=None, excl_trainops=None,
+            run_id=None):
         """ Fit.
 
         Train model, feeding X_inputs and Y_targets to the network.
@@ -117,6 +118,9 @@ class SequenceGenerator(object):
                 'checkpoint_path' specified).
             snapshot_step: `int` or None. If `int`, it will snapshot model
                 every 'snapshot_step' steps.
+            excl_trainops: `list` of `TrainOp`. A list of train ops to
+                exclude from training process (TrainOps can be retrieve
+                through `tf.get_collection_ref(tf.GraphKeys.TRAIN_OPS)`).
             run_id: `str`. Give a name for this run. (Useful for Tensorboard).
 
         """
@@ -166,6 +170,7 @@ class SequenceGenerator(object):
                          shuffle_all=shuffle,
                          dprep_dict=dprep_dict,
                          daug_dict=daug_dict,
+                         excl_trainops=excl_trainops,
                          run_id=run_id)
         self.predictor = Evaluator([self.net],
                                    session=self.trainer.session)
@@ -197,27 +202,37 @@ class SequenceGenerator(object):
 
         """
 
-        generated = seq_seed
-        sequence = seq_seed
-        whole_sequence = seq_seed
+        generated = seq_seed[:]
+        sequence = seq_seed[:]
+        whole_sequence = seq_seed[:]
 
-        if display: sys.stdout.write(generated)
+        if display: sys.stdout.write(str(generated))
 
         for i in range(seq_length):
             x = np.zeros((1, self.seq_maxlen, len(self.dic)))
             for t, char in enumerate(sequence):
                 x[0, t, self.dic[char]] = 1.
 
-            preds = self._predict(x)[0]
+            preds = self._predict(x)[0].tolist()
             next_index = _sample(preds, temperature)
             next_char = self.rev_dic[next_index]
 
-            generated += next_char
-            sequence = sequence[1:] + next_char
-            whole_sequence += next_char
+            try: #Python 2
+                unicode_or_str = [str, unicode]
+            except: #Python 3
+                unicode_or_str = [str]
+            if type(sequence) in unicode_or_str:
+                generated += next_char
+                sequence = sequence[1:] + next_char
+                whole_sequence += next_char
+            else:
+                generated.append(next_char)
+                sequence = sequence[1:]
+                sequence.append(next_char)
+                whole_sequence.append(next_char)
 
             if display:
-                sys.stdout.write(next_char)
+                sys.stdout.write(str(next_char))
                 sys.stdout.flush()
 
         if display: print()
@@ -235,16 +250,20 @@ class SequenceGenerator(object):
         """
         self.trainer.save(model_file)
 
-    def load(self, model_file):
+    def load(self, model_file, **optargs):
         """ Load.
 
         Restore model weights.
 
         Arguments:
             model_file: `str`. Model path.
+            optargs: optional extra arguments for trainer.restore (see helpers/trainer.py)
+                     These optional arguments may be used to limit the scope of
+                     variables restored, and to control whether a new session is
+                     created for the restored variables.
 
         """
-        self.trainer.restore(model_file)
+        self.trainer.restore(model_file, **optargs)
         self.session = self.trainer.session
         self.predictor = Evaluator([self.net],
                                    session=self.session,

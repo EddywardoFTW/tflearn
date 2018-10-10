@@ -11,10 +11,19 @@ _EPSILON = 1e-8
 class DataPreprocessing(object):
     """ Data Preprocessing.
 
-    Manage real-time data preprocessing.
+    Base class for applying common real-time data preprocessing.
+
+    This class is meant to be used as an argument of `input_data`. When training
+    a model, the defined pre-processing methods will be applied at both
+    training and testing time. Note that DataAugmentation is similar to
+    DataPreprocessing, but only applies at training time.
 
     Arguments:
         None.
+
+    Parameters:
+        methods: `list of function`. Augmentation methods to apply.
+        args: A `list` of arguments to use for these methods.
 
     """
 
@@ -90,6 +99,21 @@ class DataPreprocessing(object):
     # -----------------------
     #  Preprocessing Methods
     # -----------------------
+
+    def add_custom_preprocessing(self, func):
+        """ add_custom_preprocessing.
+
+        Apply any custom pre-processing function to the .
+
+        Arguments:
+            func: a `Function` that take a numpy array as input and returns
+                a numpy array.
+
+        Returns:
+            Nothing.
+        """
+        self.methods.append(func)
+        self.args.append(None)
 
     def add_samplewise_zero_center(self):
         """ add_samplewise_zero_center.
@@ -264,11 +288,13 @@ class DataPreprocessing(object):
         def __init__(self, scope, name):
             self.is_required = False
             with tf.name_scope(scope):
-                # One variable contains the value
-                self.var = tf.Variable(0., trainable=False, name=name)
-                # Another one check if it has been restored or not
-                self.var_r = tf.Variable(False, trainable=False,
-                                         name=name+"_r")
+                with tf.device('/cpu:0'):
+                    # One variable contains the value
+                    self.var = tf.Variable(0., trainable=False, name=name,
+                                           validate_shape=False)
+                    # Another one check if it has been restored or not
+                    self.var_r = tf.Variable(False, trainable=False,
+                                             name=name+"_r")
             # RAM saved vars for faster access
             self.restored = False
             self.value = None
@@ -288,13 +314,14 @@ class DataPreprocessing(object):
 
 
 class ImagePreprocessing(DataPreprocessing):
-
     """ Image Preprocessing.
 
-    Pre-processing methods designed especially for images.
+    Base class for applying real-time image related pre-processing.
 
-    Arguments:
-        None.
+    This class is meant to be used as an argument of `input_data`. When training
+    a model, the defined pre-processing methods will be applied at both
+    training and testing time. Note that ImageAugmentation is similar to
+    ImagePreprocessing, but only applies at training time.
 
     """
 
@@ -357,7 +384,7 @@ class ImagePreprocessing(DataPreprocessing):
         return new_batch
 
     # ----------------------------------------------
-    #  Preprocessing Methods (Overwrited from Base)
+    #  Preprocessing Methods (Overwritten from Base)
     # ----------------------------------------------
 
     def add_samplewise_zero_center(self, per_channel=False):
@@ -437,7 +464,7 @@ class ImagePreprocessing(DataPreprocessing):
         self.args.append(None)
 
     # --------------------------------------------------
-    #  Preprocessing Calculation (Overwrited from Base)
+    #  Preprocessing Calculation (Overwritten from Base)
     # --------------------------------------------------
 
     def _samplewise_zero_center(self, batch, per_channel=False):
@@ -458,7 +485,7 @@ class ImagePreprocessing(DataPreprocessing):
         return batch
 
     # --------------------------------------------------------------
-    #  Calulation with Persistent Parameters (Overwrited from Base)
+    #  Calulation with Persistent Parameters (Overwritten from Base)
     # --------------------------------------------------------------
 
     def _compute_global_mean(self, dataset, session, limit=None):

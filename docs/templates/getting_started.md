@@ -13,7 +13,7 @@ Layers are a core feature of TFLearn. While completely defining a model using Te
 - Create and initialize weights and biases variables
 - Apply convolution over incoming tensor
 - Add an activation function after the convolution
-- etc...
+- Etc...
 
 In Tensorflow, writing these kinds of operations can be quite tedious:
 
@@ -22,7 +22,7 @@ with tf.name_scope('conv1'):
     W = tf.Variable(tf.random_normal([5, 5, 1, 32]), dtype=tf.float32, name='Weights')
     b = tf.Variable(tf.random_normal([32]), dtype=tf.float32, name='biases')
     x = tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME')
-    x = tf.add_bias(W, b)
+    x = tf.add_bias(x, b)
     x = tf.nn.relu(x)
 ```
 
@@ -35,25 +35,25 @@ Here is a list of all currently available layers:
 
 File | Layers
 -----|-------
-[core](http://tflearn.org/layers/core/) | input_data, fully_connected, dropout, custom_layer, reshape, flatten, activation, single_unit
-[conv](http://tflearn.org/layers/conv/) | conv_2d, conv_2d_transpose, max_pool_2d, avg_pool_2d, conv_1d, max_pool_1d, avg_pool_1d, shallow_residual_block, deep_residual_block
+[core](http://tflearn.org/layers/core/) | input_data, fully_connected, dropout, custom_layer, reshape, flatten, activation, single_unit, highway, one_hot_encoding, time_distributed
+[conv](http://tflearn.org/layers/conv/) | conv_2d, conv_2d_transpose, max_pool_2d, avg_pool_2d, upsample_2d, conv_1d, max_pool_1d, avg_pool_1d, residual_block, residual_bottleneck, conv_3d, max_pool_3d, avg_pool_3d, highway_conv_1d, highway_conv_2d, global_avg_pool, global_max_pool
 [recurrent](http://tflearn.org/layers/recurrent/) | simple_rnn, lstm, gru, bidirectionnal_rnn, dynamic_rnn
 [embedding](http://tflearn.org/layers/embedding_ops/) | embedding
-[normalization](http://tflearn.org/layers/normalization/) | batch_normalization, local_response_normalization
+[normalization](http://tflearn.org/layers/normalization/) | batch_normalization, local_response_normalization, l2_normalize
 [merge](http://tflearn.org/layers/merge_ops/) | merge, merge_outputs
 [estimator](http://tflearn.org/layers/estimator/) | regression
 
 ### Built-in Operations
 
-Besides layers concept, TFLearn also provides many different ops to be used when building a neural network. These ops are firstly mean to be be part of the above 'layers' arguments, but they can also be used independently in any other Tensorflow graph for convenience. In practice, just providing the op name as argument is enough (such as activation='relu' or regularizer='L2' for conv_2d), but a function can also be provided for further customization.
+Besides layers concept, TFLearn also provides many different ops to be used when building a neural network. These ops are firstly meant to be part of the above 'layers' arguments, but they can also be used independently in any other Tensorflow graph for convenience. In practice, just providing the op name as argument is enough (such as activation='relu' or regularizer='L2' for conv_2d), but a function can also be provided for further customization.
 
 File | Ops
 -----|----
 [activations](http://tflearn.org/activations) | linear, tanh, sigmoid, softmax, softplus, softsign, relu, relu6, leaky_relu, prelu, elu
-[objectives](http://tflearn.org/objectives) | softmax_categorical_crossentropy, categorical_crossentropy, binary_crossentropy, mean_square, hinge_loss
-[optimizers](http://tflearn.org/optimizers) | SGD, RMSProp, Adam, Momentum, AdaGrad, Ftrl
+[objectives](http://tflearn.org/objectives) | softmax_categorical_crossentropy, categorical_crossentropy, binary_crossentropy, mean_square, hinge_loss, roc_auc_score, weak_cross_entropy_2d
+[optimizers](http://tflearn.org/optimizers) | SGD, RMSProp, Adam, Momentum, AdaGrad, Ftrl, AdaDelta
 [metrics](http://tflearn.org/metrics) | Accuracy, Top_k, R2
-[initializations](http://tflearn.org/initializations) | zeros, uniform, uniform_scaling, normal, truncated_normal
+[initializations](http://tflearn.org/initializations) | zeros, uniform, uniform_scaling, normal, truncated_normal, xavier, variance_scaling
 [losses](http://tflearn.org/losses) | l1, l2
 
 Below are some quick examples:
@@ -160,13 +160,13 @@ To get or set the value of these variables, TFLearn models class implement `get_
 ```python
 input_data = tflearn.input_data(shape=[None, 784])
 fc1 = tflearn.fully_connected(input_data, 64)
-fc2 = tflearn.fully_connected(input_data, 10, activation='softmax')
-net = tflearn.regression(fc1)
+fc2 = tflearn.fully_connected(fc1, 10, activation='softmax')
+net = tflearn.regression(fc2)
 model = DNN(net)
-# Get weights values of fc1
-model.get_weights(fc1.W)
-# Assign new random weights to fc1
-model.set_weights(fc1.W, numpy.random.rand(64, 10))
+# Get weights values of fc2
+model.get_weights(fc2.W)
+# Assign new random weights to fc2
+model.set_weights(fc2.W, numpy.random.rand(64, 10))
 ```
 
 Note that you can also directly use TensorFlow `eval` or `assign` ops to get or set the value of these variables.
@@ -205,7 +205,7 @@ model = DNN(network)
 model.fit(X, Y)
 ```
 
-For an example, see: [hdf5.py](https://github.com/tflearn/tflearn/blob/master/examples/basics/hdf5.py).
+For an example, see: [hdf5.py](https://github.com/tflearn/tflearn/blob/master/examples/basics/use_hdf5.py).
 
 ### Data Preprocessing and Data Augmentation
 It is common to perform data pre-processing and data augmentation while training a model, so TFLearn provides wrappers to easily handle it. Note also that TFLearn data stream is designed with computing pipelines in order to speed-up training (by pre-processing data on CPU while GPU is performing model training).
@@ -229,11 +229,37 @@ network = input_data(shape=[None, 32, 32, 3],
                      data_augmentation=img_aug)
 ```
 
-For more details, see [Data Preprocessing](http://tflearn.org/data_preprocessing) and [Data Augmentation](http://tflearn.org/data_augmentation)
+For more details, see [Data Preprocessing](http://tflearn.org/data_preprocessing) and [Data Augmentation](http://tflearn.org/data_augmentation).
+
+### Scopes & Weights sharing
+
+All layers are built over 'variable_op_scope', that makes it easy to share variables among multiple layers and make TFLearn suitable for distributed training. All layers with inner variables support a 'scope' argument to place variables under; layers with same scope name will then share the same weights.
+
+```python
+# Define a model builder
+def my_model(x):
+    x = tflearn.fully_connected(x, 32, scope='fc1')
+    x = tflearn.fully_connected(x, 32, scope='fc2')
+    x = tflearn.fully_connected(x, 2, scope='out')
+
+# 2 different computation graphs but sharing the same weights
+with tf.device('/gpu:0'):
+    # Force all Variables to reside on the CPU.
+    with tf.arg_scope([tflearn.variables.variable], device='/cpu:0'):
+        model1 = my_model(placeholder_X)
+# Reuse Variables for the next model
+tf.get_variable_scope().reuse_variables()
+with tf.device('/gpu:1'):
+    with tf.arg_scope([tflearn.variables.variable], device='/cpu:0'):
+        model2 = my_model(placeholder_X)
+
+# Model can now be trained by multiple GPUs (see gradient averaging)
+...
+```
 
 ### Graph Initialization
 
-It might be useful to limit resources, or assigns more or less GPU RAM memory while training. To do so, a graph initializer can be used to configure a graph before run:
+It might be useful to limit resources, or assign more or less GPU RAM memory while training. To do so, a graph initializer can be used to configure a graph before run:
 
 ```python
 tflearn.init_graph(set_seed=8888, num_cores=16, gpu_memory_fraction=0.5)
@@ -267,7 +293,7 @@ net = tf.nn.max_pool(net, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAM
 
 ### Built-in Operations
 
-TFLearn built-in ops makes Tensorflow graphs writing faster and more readable. So, similar to layers, built-in ops are fully compatible with any TensorFlow expression. The following code example shows how to use them along with pure Tensorflow API.
+TFLearn built-in ops make Tensorflow graphs writing faster and more readable. So, similar to layers, built-in ops are fully compatible with any TensorFlow expression. The following code example shows how to use them along with pure Tensorflow API.
 
 - See: [builtin_ops.py](https://github.com/tflearn/tflearn/blob/master/examples/extending_tensorflow/builtin_ops.py).
 
@@ -276,10 +302,10 @@ Here is a list of available ops, click on the file for more details:
 File | Ops
 -----|----
 [activations](http://tflearn.org/activations) | linear, tanh, sigmoid, softmax, softplus, softsign, relu, relu6, leaky_relu, prelu, elu
-[objectives](http://tflearn.org/objectives) | softmax_categorical_crossentropy, categorical_crossentropy, binary_crossentropy, mean_square, hinge_loss
-[optimizers](http://tflearn.org/optimizers) | SGD, RMSProp, Adam, Momentum, AdaGrad, Ftrl
-[metrics](http://tflearn.org/metrics#accuracy_op) | accuracy_op, top_k_op, r2_op
-[initializations](http://tflearn.org/initializations) | zeros, uniform, uniform_scaling, normal, truncated_normal
+[objectives](http://tflearn.org/objectives) | softmax_categorical_crossentropy, categorical_crossentropy, binary_crossentropy, mean_square, hinge_loss, roc_auc_score, weak_cross_entropy_2d
+[optimizers](http://tflearn.org/optimizers) | SGD, RMSProp, Adam, Momentum, AdaGrad, Ftrl, AdaDelta
+[metrics](http://tflearn.org/metrics) | Accuracy, Top_k, R2
+[initializations](http://tflearn.org/initializations) | zeros, uniform, uniform_scaling, normal, truncated_normal, xavier, variance_scaling
 [losses](http://tflearn.org/losses) | l1, l2
 
 Note:
@@ -295,7 +321,7 @@ TFLearn implements a `TrainOp` class to represent an optimization process (i.e. 
 trainop = TrainOp(net=my_network, loss=loss, metric=accuracy)
 ```
 
-Then, all TrainOp can be feeded into a `Trainer` class, that will handle the whole training process, considering all TrainOp together as a whole model.
+Then, all TrainOp can be fed into a `Trainer` class, that will handle the whole training process, considering all TrainOp together as a whole model.
 
 ```python
 model = Trainer(trainops=trainop, tensorboard_dir='/tmp/tflearn')
@@ -346,11 +372,59 @@ tflearn.is_training(False)
 
 - See: [training config](http://tflearn.org/config#is_training).
 
+### Training Callbacks
+
+During the training cycle, TFLearn gives you the possibility to track and interact with the metrics of the training throughout a set of functions given by the [Callback](https://github.com/tflearn/tflearn/blob/master/tflearn/callbacks.py#L10) interface.
+To simplify the metrics retrieval, each callback method received a [TrainingState](https://github.com/tflearn/tflearn/blob/master/tflearn/helpers/trainer.py#L976) which track the state (e.g. : current epoch, step, batch iteration) and metrics (e.g. : current validation accuracy, global accuracy etc..)
+
+Callback methods which relate to the training cycle : 
+- `on_train_begin(training_state)`
+- `on_epoch_begin(training_state)`
+- `on_batch_begin(training_state)`
+- `on_sub_batch_begin(training_state)`
+- `on_sub_batch_end(training_state, train_index)`
+- `on_batch_end(training_state, snapshot)`
+- `on_epoch_end(training_state)`
+- `on_train_end(training_state)`
+
+#### How to use it:
+Imagine you have your own monitor which track all your training jobs and you need to send metrics to it. You can easily do this by creating a custom callback which will get data and send it to the distant monitor.
+We need to create a CustomCallback and add your logic in the `on_epoch_end` which is called at the end of an epoch.
+
+This will give you something like that:
+```python
+class MonitorCallback(tflearn.callbacks.Callback):
+    def __init__(self, api):
+        self.my_monitor_api = api
+    
+    def on_epoch_end(self, training_state):
+        self.my_monitor_api.send({
+            accuracy: training_state.global_acc,
+            loss: training_state.global_loss,
+        })
+
+```
+
+Then you just need to add it on the `model.fit` call
+
+```python
+
+
+monitorCallback = MonitorCallback(api) # "api" is your API class
+model = ...
+
+model.fit(..., callbacks=monitorCallback)
+
+```
+
+The `callbacks` argument can take a `Callback` or a `list` of callbacks.
+That's it, your custom callback will be automatically called at each epoch end.
+
 ### Variables
 
 TFLearn defines a set of functions for users to quickly define variables.
 
-While in Tensorflow, variable creation requires predefined value or initializer, as well as an explicit device placement, TFLearn simplify variable definition:
+While in Tensorflow, variable creation requires predefined value or initializer, as well as an explicit device placement, TFLearn simplifies variable definition:
 
 ```python
 import tflearn.variables as vs

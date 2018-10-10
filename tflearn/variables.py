@@ -4,9 +4,15 @@ from __future__ import division, print_function, absolute_import
 import tensorflow as tf
 import tflearn
 
+from tflearn.vendor.arg_scope import add_arg_scope as contrib_add_arg_scope
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import variable_scope
 
+
+@contrib_add_arg_scope
 def variable(name, shape=None, dtype=tf.float32, initializer=None,
-             regularizer=None, trainable=True, collections=None, device='',
+             regularizer=None, trainable=True, collections=None,
+             caching_device=None, validate_shape=True, device=None,
              restore=True):
     """ variable.
 
@@ -22,7 +28,11 @@ def variable(name, shape=None, dtype=tf.float32, initializer=None,
             tflearn.losses for references).
         trainable: `bool`. If True, this variable weights will be trained.
         collections: `str`. A collection to add the new variable to (optional).
-        device: `str`. Device ID to store the variable. Default: '/cpu:0'.
+        caching_device: `str`. Optional device string or function describing
+            where the Variable should be cached for reading.  Defaults to the
+            Variable's device.
+        validate_shape: `bool`. Validate or not shape when restoring.
+        device: `str`. Optional device ID to store the variable.
         restore: `bool`. Restore or not this variable when loading a
             pre-trained model (Only compatible with tflearn pre-built
             training functions).
@@ -34,31 +44,30 @@ def variable(name, shape=None, dtype=tf.float32, initializer=None,
 
     if isinstance(initializer, str):
         initializer = tflearn.initializations.get(initializer)()
+    # Remove shape param if initializer is a Tensor
+    if not callable(initializer) and isinstance(initializer, tf.Tensor):
+        shape = None
 
     if isinstance(regularizer, str):
-        regularizer = tflearn.losses.get(regularizer)
+        regularizer = tflearn.regularizers.get(regularizer)
 
-    with tf.device(device):
+    collections = set(collections or [])
+    collections |= set([ops.GraphKeys.GLOBAL_VARIABLES,
+                        ops.GraphKeys.MODEL_VARIABLES])
 
-        try:
-            var = tf.get_variable(name, shape=shape, dtype=dtype,
-                                  initializer=initializer,
-                                  regularizer=regularizer,
-                                  trainable=trainable,
-                                  collections=collections)
-        # Fix for old TF versions
-        except Exception as e:
-            var = tf.get_variable(name, shape=shape, dtype=dtype,
-                                  initializer=initializer,
-                                  trainable=trainable,
-                                  collections=collections)
-            if regularizer is not None:
-                tflearn.add_weights_regularizer(var, regularizer)
+    with ops.device(device or ''):
+        var = variable_scope.get_variable(name, shape=shape, dtype=dtype,
+                                           initializer=initializer,
+                                           regularizer=regularizer,
+                                           trainable=trainable,
+                                           collections=collections,
+                                           caching_device=caching_device,
+                                           validate_shape=validate_shape)
 
-        if not restore:
-            tf.add_to_collection(tf.GraphKeys.EXCL_RESTORE_VARS, var)
+    if not restore:
+        tf.add_to_collection(tf.GraphKeys.EXCL_RESTORE_VARS, var)
 
-        return var
+    return var
 
 
 def get_all_variables():
@@ -70,7 +79,10 @@ def get_all_variables():
         A list of Variables.
 
     """
-    return tf.get_collection(tf.GraphKeys.VARIABLES)
+    try:
+        return tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+    except Exception:
+        return tf.get_collection(tf.GraphKeys.VARIABLES)
 
 
 def get_all_trainable_variable():
@@ -97,7 +109,18 @@ def get_layer_variables_by_name(name):
         A list of Variables.
 
     """
-    return tf.get_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name + '/')
+    return tf.get_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name)
+
+# Shortcut
+get_layer_variables = get_layer_variables_by_name
+
+
+def get_layer_variables_by_scope(scope_name):
+    ret = []
+    for v in tf.get_collection(tf.GraphKeys.MODEL_VARIABLES):
+        if scope_name + '/' in v.name:
+            ret.append(v)
+    return ret
 
 
 def get_value(var, session=None):
@@ -120,7 +143,7 @@ def get_value(var, session=None):
 
 
 def set_value(var, value, session=None):
-    """ get_value.
+    """ set_value.
 
     Set a variable's value. If no session provided, use default one.
 
@@ -134,7 +157,7 @@ def set_value(var, value, session=None):
     op = tf.assign(var, value=value)
     if not session:
         session = tf.get_default_session()
-    return op.eval(session)
+    return op.eval(session=session)
 
 
 def get_inputs_placeholder_by_name(name):
@@ -169,7 +192,7 @@ def get_targets_placeholder_by_name(name):
             return e
     # Search again, in case defined outside TFLearn wrappers.
     for e in vars:
-        if e.name == name:
+        if e.name == name+':0':
             return e
 
     return None

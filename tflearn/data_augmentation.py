@@ -12,10 +12,19 @@ except Exception:
 class DataAugmentation(object):
     """ Data Augmentation.
 
-    Base class for managing data augmentation.
+    Base class for applying common real-time data augmentation.
+
+    This class is meant to be used as an argument of `input_data`. When training
+    a model, the defined augmentation methods will be applied at training
+    time only. Note that DataPreprocessing is similar to DataAugmentation,
+    but applies at both training time and testing time.
 
     Arguments:
-        None.
+        None
+
+    Parameters:
+        methods: `list of function`. The augmentation methods to apply.
+        args: A `list` of arguments list to use for these methods.
 
     """
 
@@ -33,12 +42,21 @@ class DataAugmentation(object):
 
 
 class ImageAugmentation(DataAugmentation):
-    """ ImageAugmentation.
+    """ Image Augmentation.
 
-    Augmentation methods designed especially for images.
+    Base class for applying real-time augmentation related to images.
+
+    This class is meant to be used as an argument of `input_data`. When training
+    a model, the defined augmentation methods will be applied at training
+    time only. Note that ImagePreprocessing is similar to ImageAugmentation,
+    but applies at both training time and testing time.
 
     Arguments:
         None.
+
+    Parameters:
+        methods: `list of function`. The augmentation methods to apply.
+        args: A `list` of arguments list to use for these methods.
 
     """
 
@@ -66,7 +84,7 @@ class ImageAugmentation(DataAugmentation):
             imgaug.add_random_crop((32, 32), 6)
             ```
 
-        Args:
+        Arguments:
             crop_shape: `tuple` of `int`. The crop shape (height, width).
             padding: `int`. If not None, the image is padded with 'padding' 0s.
 
@@ -98,13 +116,28 @@ class ImageAugmentation(DataAugmentation):
             Nothing.
 
         """
-        self.methods.append(self._random_flip_leftright)
+        self.methods.append(self._random_flip_updown)
         self.args.append(None)
+
+    def add_random_90degrees_rotation(self, rotations=[0, 1, 2, 3]):
+        """ add_random_90degrees_rotation
+
+        Randomly perform 90 degrees rotations.
+
+        Arguments:
+            rotations: `list`. Allowed 90 degrees rotations.
+
+        Return:
+             Nothing.
+
+        """
+        self.methods.append(self._random_90degrees_rotation)
+        self.args.append([rotations])
 
     def add_random_rotation(self, max_angle=20.):
         """ add_random_rotation.
 
-        Randomly rotate an image by a random angle (-`max_angle`, `max_angle`).
+        Randomly rotate an image by a random angle (-max_angle, max_angle).
 
         Arguments:
             max_angle: `float`. The maximum rotation angle.
@@ -120,7 +153,7 @@ class ImageAugmentation(DataAugmentation):
         """ add_random_blur.
 
         Randomly blur an image by applying a gaussian filter with a random
-        sigma (0., `sigma_max`).
+        sigma (0., sigma_max).
 
         Arguments:
             sigma: `float` or list of `float`. Standard deviation for Gaussian
@@ -141,13 +174,15 @@ class ImageAugmentation(DataAugmentation):
 
     def _random_crop(self, batch, crop_shape, padding=None):
         oshape = np.shape(batch[0])
+        if padding:
+            oshape = (oshape[0] + 2*padding, oshape[1] + 2*padding)
         new_batch = []
         npad = ((padding, padding), (padding, padding), (0, 0))
         for i in range(len(batch)):
             new_batch.append(batch[i])
             if padding:
                 new_batch[i] = np.lib.pad(batch[i], pad_width=npad,
-                                      mode='constant', constant_values=0)
+                                          mode='constant', constant_values=0)
             nh = random.randint(0, oshape[0] - crop_shape[0])
             nw = random.randint(0, oshape[1] - crop_shape[1])
             new_batch[i] = new_batch[i][nh:nh + crop_shape[0],
@@ -164,6 +199,13 @@ class ImageAugmentation(DataAugmentation):
         for i in range(len(batch)):
             if bool(random.getrandbits(1)):
                 batch[i] = np.flipud(batch[i])
+        return batch
+
+    def _random_90degrees_rotation(self, batch, rotations=[0, 1, 2, 3]):
+        for i in range(len(batch)):
+            num_rotations = random.choice(rotations)
+            batch[i] = np.rot90(batch[i], num_rotations)
+
         return batch
 
     def _random_rotation(self, batch, max_angle):

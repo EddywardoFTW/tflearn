@@ -11,8 +11,8 @@ import numpy
 SOURCE_URL = 'http://yann.lecun.com/exdb/mnist/'
 
 
-def load_data(one_hot=False):
-    mnist = read_data_sets("mnist/", one_hot=one_hot)
+def load_data(data_dir="mnist/", one_hot=False):
+    mnist = read_data_sets(data_dir, one_hot=one_hot)
     return mnist.train.images, mnist.train.labels, mnist.test.images, mnist.test.labels
 
 
@@ -31,8 +31,12 @@ def maybe_download(filename, work_directory):
 
 
 def _read32(bytestream):
-    dt = numpy.dtype(numpy.uint32).newbyteorder('>')
-    return numpy.frombuffer(bytestream.read(4), dtype=dt)
+    try:
+        dt = numpy.dtype(numpy.uint32).newbyteorder('>')
+        return numpy.frombuffer(bytestream.read(4), dtype=dt)[0]
+    except Exception:
+        dt = numpy.dtype(numpy.uint32).newbyteorder('>')
+        return numpy.frombuffer(bytestream.read(4), dtype=dt)
 
 
 def extract_images(filename):

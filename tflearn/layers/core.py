@@ -2,6 +2,8 @@ from __future__ import division, print_function, absolute_import
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.framework import dtypes
+from tensorflow.python.ops import standard_ops
 
 import tflearn
 
@@ -9,7 +11,7 @@ from tflearn import utils
 from tflearn import variables as va
 from tflearn import activations
 from tflearn import initializations
-from tflearn import losses
+from tflearn import regularizers
 
 
 def input_data(shape=None, placeholder=None, dtype=tf.float32,
@@ -17,12 +19,20 @@ def input_data(shape=None, placeholder=None, dtype=tf.float32,
                name="InputData"):
     """ Input Data.
 
-    `input_data` is used as a data entry (placeholder) of a network.
-    This placeholder will be feeded with data when training
+    This layer is used for inputting (aka. feeding) data to a network.
+    A TensorFlow placeholder will be used if it is supplied,
+    otherwise a new placeholder will be created with the given shape.
 
-    This layer is used to keep track of the network inputs, by adding the
-    placeholder to INPUTS graphkey. TFLearn training functions may retrieve
-    those variables to setup the network training process.
+    Either a shape or placeholder must be provided, otherwise an
+    exception will be raised.
+
+    Furthermore, the placeholder is added to TensorFlow collections
+    so it can be retrieved using tf.get_collection(tf.GraphKeys.INPUTS)
+    as well as tf.GraphKeys.LAYER_TENSOR + '/' + name. Similarly for
+    the data preprocessing and augmentation objects which are stored in
+    the collections with tf.GraphKeys.DATA_PREP and tf.GraphKeys.DATA_AUG.
+    This allows other parts of TFLearn to easily retrieve and use these
+    objects by referencing these graph-keys.
 
     Input:
         List of `int` (Shape), to create a new placeholder.
@@ -34,7 +44,7 @@ def input_data(shape=None, placeholder=None, dtype=tf.float32,
 
     Arguments:
         shape: list of `int`. An array or tuple representing input data shape.
-            It is required if no placeholder provided. First element should
+            It is required if no placeholder is provided. First element should
             be 'None' (representing batch size), if not provided, it will be
             added automatically.
         placeholder: A Placeholder to use for feeding this layer (optional).
@@ -52,22 +62,31 @@ def input_data(shape=None, placeholder=None, dtype=tf.float32,
         name: `str`. A name for this layer (optional).
 
     """
-    if not shape and not placeholder:
-        raise Exception("`shape` or `placeholder` argument is required.")
 
-    if not placeholder:
-        # Add 'None' if missing
-        assert shape is not None, "A shape or a placeholder must be provided."
-        if len(shape) > 1:
-            if shape[0] is not None:
-                shape = list(shape)
-                shape = [None] + shape
-        with tf.name_scope(name) as scope:
+    # We need either a placeholder or a shape, otherwise raise an exception.
+    if placeholder is None:
+        if shape is None:
+            raise Exception("Either a `shape` or `placeholder` argument is required to consruct an input layer.")
+
+        # We have a shape but no placeholder, so we must now create a placeholder.
+
+        # Ensure the first element of shape is None by prepending None if necessary.
+        # TODO: Why is there a len(shape)>1 condition? Please explain here.
+        if len(shape) > 1 and shape[0] is not None:
+            shape = list(shape)
+            shape = [None] + shape
+
+        # Create a new tf.placeholder with the given shape.
+        with tf.name_scope(name):
             placeholder = tf.placeholder(shape=shape, dtype=dtype, name="X")
 
-    # Keep track of inputs
+    # Store the placeholder object in TensorFlow collections so it can be
+    # retrieved and used elsewhere.
     tf.add_to_collection(tf.GraphKeys.INPUTS, placeholder)
-    # Keep track of data preprocessing and augmentation
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, placeholder)
+
+    # Store the objects for data-preprocessing and -augmentation
+    # in TensorFlow collections so they can be retrieved and used elsewhere.
     tf.add_to_collection(tf.GraphKeys.DATA_PREP, data_preprocessing)
     tf.add_to_collection(tf.GraphKeys.DATA_AUG, data_augmentation)
 
@@ -77,7 +96,8 @@ def input_data(shape=None, placeholder=None, dtype=tf.float32,
 def fully_connected(incoming, n_units, activation='linear', bias=True,
                     weights_init='truncated_normal', bias_init='zeros',
                     regularizer=None, weight_decay=0.001, trainable=True,
-                    restore=True, name="FullyConnected"):
+                    restore=True, reuse=False, scope=None,
+                    name="FullyConnected"):
     """ Fully Connected.
 
     A fully connected layer.
@@ -99,13 +119,18 @@ def fully_connected(incoming, n_units, activation='linear', bias=True,
             (see tflearn.initializations) Default: 'truncated_normal'.
         bias_init: `str` (name) or `Tensor`. Bias initialization.
             (see tflearn.initializations) Default: 'zeros'.
-       regularizer: `str` (name) or `Tensor`. Add a regularizer to this
+        regularizer: `str` (name) or `Tensor`. Add a regularizer to this
             layer weights (see tflearn.regularizers). Default: None.
-       weight_decay: `float`. Regularizer decay parameter. Default: 0.001.
-       trainable: `bool`. If True, weights will be trainable.
-       restore: `bool`. If True, this layer weights will be restored when
+        weight_decay: `float`. Regularizer decay parameter. Default: 0.001.
+        trainable: `bool`. If True, weights will be trainable.
+        restore: `bool`. If True, this layer weights will be restored when
             loading a model.
-       name: A name for this layer (optional). Default: 'FullyConnected'.
+        reuse: `bool`. If True and 'scope' is provided, this layer variables
+            will be reused (shared).
+        scope: `str`. Define this layer scope (optional). A scope can be
+            used to share variables between layers. Note that scope will
+            override name.
+        name: A name for this layer (optional). Default: 'FullyConnected'.
 
     Attributes:
         scope: `Scope`. This layer scope.
@@ -117,27 +142,36 @@ def fully_connected(incoming, n_units, activation='linear', bias=True,
     assert len(input_shape) > 1, "Incoming Tensor shape must be at least 2-D"
     n_inputs = int(np.prod(input_shape[1:]))
 
-    # Build variables and inference.
-    with tf.name_scope(name) as scope:
+    with tf.variable_scope(scope, default_name=name, values=[incoming],
+                           reuse=reuse) as scope:
+        name = scope.name
 
         W_init = weights_init
+        filter_size = [n_inputs, n_units]
         if isinstance(weights_init, str):
             W_init = initializations.get(weights_init)()
+        elif type(W_init) in [tf.Tensor, np.ndarray, list]:
+            filter_size = None
         W_regul = None
-        if regularizer:
-            W_regul = lambda x: losses.get(regularizer)(x, weight_decay)
-        W = va.variable(scope + 'W', shape=[n_inputs, n_units],
-                        regularizer=W_regul, initializer=W_init,
-                        trainable=trainable, restore=restore)
-        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + scope, W)
+        if regularizer is not None:
+            W_regul = lambda x: regularizers.get(regularizer)(x, weight_decay)
+        W = va.variable('W', shape=filter_size, regularizer=W_regul,
+                        initializer=W_init, trainable=trainable,
+                        restore=restore)
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W)
 
         b = None
         if bias:
-            b_init = initializations.get(bias_init)()
-            b = va.variable(scope + 'b', shape=[n_units],
-                            initializer=b_init, trainable=trainable,
-                            restore=restore)
-            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + scope, b)
+            b_shape = [n_units]
+            if isinstance(bias_init, str):
+                bias_init = initializations.get(bias_init)()
+            elif type(bias_init) in [tf.Tensor, np.ndarray, list]:
+                b_shape = None
+            if isinstance(bias_init, str):
+                bias_init = initializations.get(bias_init)()
+            b = va.variable('b', shape=b_shape, initializer=bias_init,
+                            trainable=trainable, restore=restore)
+            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, b)
 
         inference = incoming
         # If input is not 2d, flatten it.
@@ -145,14 +179,14 @@ def fully_connected(incoming, n_units, activation='linear', bias=True,
             inference = tf.reshape(inference, [-1, n_inputs])
 
         inference = tf.matmul(inference, W)
-        if b: inference = tf.nn.bias_add(inference, b)
-
-        if isinstance(activation, str):
-            inference = activations.get(activation)(inference)
-        elif hasattr(activation, '__call__'):
-            inference = activation(inference)
-        else:
-            raise ValueError("Invalid Activation.")
+        if b is not None: inference = tf.nn.bias_add(inference, b)
+        if activation:
+            if isinstance(activation, str):
+                inference = activations.get(activation)(inference)
+            elif hasattr(activation, '__call__'):
+                inference = activation(inference)
+            else:
+                raise ValueError("Invalid Activation.")
 
         # Track activations.
         tf.add_to_collection(tf.GraphKeys.ACTIVATIONS, inference)
@@ -162,19 +196,31 @@ def fully_connected(incoming, n_units, activation='linear', bias=True,
     inference.W = W
     inference.b = b
 
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, inference)
+
     return inference
 
 
-def dropout(incoming, keep_prob, name="Dropout"):
+def dropout(incoming, keep_prob, noise_shape=None, name="Dropout"):
     """ Dropout.
 
     Outputs the input element scaled up by `1 / keep_prob`. The scaling is so
     that the expected sum is unchanged.
 
+    By default, each element is kept or dropped independently. If noise_shape
+    is specified, it must be broadcastable to the shape of x, and only dimensions
+    with noise_shape[i] == shape(x)[i] will make independent decisions. For
+    example, if shape(x) = [k, l, m, n] and noise_shape = [k, 1, 1, n], each
+    batch and channel component will be kept independently and each row and column
+    will be kept or not kept together.
+
     Arguments:
         incoming : A `Tensor`. The incoming tensor.
         keep_prob : A float representing the probability that each element
             is kept.
+        noise_shape : A 1-D Tensor of type int32, representing the shape for
+            randomly generated keep/drop flags.
         name : A name for this layer (optional).
 
     References:
@@ -195,13 +241,16 @@ def dropout(incoming, keep_prob, name="Dropout"):
         def apply_dropout():
             if type(inference) in [list, np.array]:
                 for x in inference:
-                    x = tf.nn.dropout(x, keep_prob)
+                    x = tf.nn.dropout(x, keep_prob, noise_shape)
                 return inference
             else:
-                return tf.nn.dropout(inference, keep_prob)
+                return tf.nn.dropout(inference, keep_prob, noise_shape)
 
         is_training = tflearn.get_training_mode()
         inference = tf.cond(is_training, apply_dropout, lambda: inference)
+
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, inference)
 
     return inference
 
@@ -243,11 +292,14 @@ def reshape(incoming, new_shape, name="Reshape"):
     with tf.name_scope(name) as scope:
         inference = incoming
         if isinstance(inference, list):
-            inference = tf.concat(inference, 0)
+            inference = tf.concat(0, inference)
             inference = tf.cast(inference, tf.float32)
         inference = tf.reshape(inference, shape=new_shape)
 
     inference.scope = scope
+
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, inference)
 
     return inference
 
@@ -270,10 +322,15 @@ def flatten(incoming, name="Flatten"):
     input_shape = utils.get_incoming_shape(incoming)
     assert len(input_shape) > 1, "Incoming Tensor shape must be at least 2-D"
     dims = int(np.prod(input_shape[1:]))
-    return reshape(incoming, [-1, dims], name)
+    x = reshape(incoming, [-1, dims], name)
+
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, x)
+
+    return x
 
 
-def activation(incoming, activation='linear'):
+def activation(incoming, activation='linear', name='activation'):
 
     """ Activation.
 
@@ -288,15 +345,20 @@ def activation(incoming, activation='linear'):
     """
 
     if isinstance(activation, str):
-        return activations.get(activation)(incoming)
-    elif hasattr(incoming, '__call__'):
-        return activation(incoming)
+        x = activations.get(activation)(incoming)
+    elif hasattr(activation, '__call__'):
+        x = activation(incoming)
     else:
         raise ValueError('Unknown activation type.')
 
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, x)
+
+    return x
+
 
 def single_unit(incoming, activation='linear', bias=True, trainable=True,
-                restore=True, name="Linear"):
+                restore=True, reuse=False, scope=None, name="Linear"):
     """ Single Unit.
 
     A single unit (Linear) Layer.
@@ -315,7 +377,12 @@ def single_unit(incoming, activation='linear', bias=True, trainable=True,
         trainable: `bool`. If True, weights will be trainable.
         restore: `bool`. If True, this layer weights will be restored when
             loading a model.
-        name: A name for this layer (optional). Default: 'Dense'.
+        reuse: `bool`. If True and 'scope' is provided, this layer variables
+            will be reused (shared).
+        scope: `str`. Define this layer scope (optional). A scope can be
+            used to share variables between layers. Note that scope will
+            override name.
+        name: A name for this layer (optional). Default: 'Linear'.
 
     Attributes:
         W: `Tensor`. Variable representing weight.
@@ -326,27 +393,29 @@ def single_unit(incoming, activation='linear', bias=True, trainable=True,
     n_inputs = int(np.prod(input_shape[1:]))
 
     # Build variables and inference.
-    with tf.name_scope(name) as scope:
+    with tf.variable_scope(scope, default_name=name, values=[incoming],
+                           reuse=reuse) as scope:
+        name = scope.name
 
-        W = va.variable(scope + 'W', shape=[n_inputs],
+        W = va.variable('W', shape=[n_inputs],
                         initializer=tf.constant_initializer(np.random.randn()),
                         trainable=trainable, restore=restore)
-        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + scope, W)
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W)
 
         b = None
         if bias:
-            b = va.variable(scope + 'b', shape=[n_inputs],
+            b = va.variable('b', shape=[n_inputs],
                             initializer=tf.constant_initializer(np.random.randn()),
                             trainable=trainable, restore=restore)
-            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + scope, b)
+            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, b)
 
         inference = incoming
         # If input is not 2d, flatten it.
         if len(input_shape) > 1:
             inference = tf.reshape(inference, [-1])
 
-        inference = tf.mul(inference, W)
-        if b: inference = tf.add(inference, b)
+        inference = tf.multiply(inference, W)
+        if b is not None: inference = tf.add(inference, b)
 
         if isinstance(activation, str):
             inference = activations.get(activation)(inference)
@@ -363,13 +432,17 @@ def single_unit(incoming, activation='linear', bias=True, trainable=True,
     inference.W = W
     inference.b = b
 
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, inference)
+
     return inference
-    
-    
-def highway(incoming, n_units, activation='linear',
+
+
+def highway(incoming, n_units, activation='linear', transform_dropout=None,
             weights_init='truncated_normal', bias_init='zeros',
             regularizer=None, weight_decay=0.001, trainable=True,
-            restore=True, name="FullyConnectedHighway"):
+            restore=True, reuse=False, scope=None,
+            name="FullyConnectedHighway"):
     """ Fully Connected Highway.
 
     A fully connected highway network layer, with some inspiration from
@@ -387,6 +460,7 @@ def highway(incoming, n_units, activation='linear',
         activation: `str` (name) or `function` (returning a `Tensor`).
             Activation applied to this layer (see tflearn.activations).
             Default: 'linear'.
+        transform_dropout: `float`: Keep probability on the highway transform gate.
         weights_init: `str` (name) or `Tensor`. Weights initialization.
             (see tflearn.initializations) Default: 'truncated_normal'.
         bias_init: `str` (name) or `Tensor`. Bias initialization.
@@ -397,7 +471,12 @@ def highway(incoming, n_units, activation='linear',
         trainable: `bool`. If True, weights will be trainable.
         restore: `bool`. If True, this layer weights will be restored when
             loading a model
-         name: A name for this layer (optional). Default: 'FullyConnectedHighway'.
+        reuse: `bool`. If True and 'scope' is provided, this layer variables
+            will be reused (shared).
+        scope: `str`. Define this layer scope (optional). A scope can be
+            used to share variables between layers. Note that scope will
+            override name.
+        name: A name for this layer (optional). Default: 'FullyConnectedHighway'.
 
     Attributes:
         scope: `Scope`. This layer scope.
@@ -405,7 +484,7 @@ def highway(incoming, n_units, activation='linear',
         W_t: `Tensor`. Variable representing units weights for transform gate.
         b: `Tensor`. Variable representing biases.
         b_t: `Tensor`. Variable representing biases for transform gate.
-        
+
     Links:
         [https://arxiv.org/abs/1505.00387](https://arxiv.org/abs/1505.00387)
 
@@ -415,37 +494,37 @@ def highway(incoming, n_units, activation='linear',
     n_inputs = int(np.prod(input_shape[1:]))
 
     # Build variables and inference.
-    with tf.name_scope(name) as scope:
+    with tf.variable_scope(scope, default_name=name, values=[incoming],
+                           reuse=reuse) as scope:
+        name = scope.name
 
         W_init = weights_init
         if isinstance(weights_init, str):
             W_init = initializations.get(weights_init)()
         W_regul = None
-        if regularizer:
-            W_regul = lambda x: losses.get(regularizer)(x, weight_decay)
-        W = va.variable(scope + 'W', shape=[n_inputs, n_units],
-                        regularizer=W_regul, initializer=W_init,
-                        trainable=trainable, restore=restore)
-        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + scope, W)
-
-        b = None
-        b_init = initializations.get(bias_init)()
-        b = va.variable(scope + 'b', shape=[n_units],
-                        initializer=b_init, trainable=trainable,
+        if regularizer is not None:
+            W_regul = lambda x: regularizers.get(regularizer)(x, weight_decay)
+        W = va.variable('W', shape=[n_inputs, n_units], regularizer=W_regul,
+                        initializer=W_init, trainable=trainable,
                         restore=restore)
-        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + scope, b)
-            
-        #weight and bias for the transform gate
-        with tf.name_scope('transform_gate') as transform_gate:
-            W_T = va.variable(transform_gate + 'W', shape=[n_inputs, n_units],
-                            regularizer=None, initializer=W_init,
-                            trainable=trainable, restore=restore)
-            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + transform_gate, W_T) 
-            
-            b_T = va.variable(transform_gate + 'b', shape=[n_units],
-                            initializer=tf.constant_initializer(-1), trainable=trainable,
-                            restore=restore)
-            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + transform_gate, b_T)
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W)
+
+        if isinstance(bias_init, str):
+            bias_init = initializations.get(bias_init)()
+        b = va.variable('b', shape=[n_units], initializer=bias_init,
+                        trainable=trainable, restore=restore)
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, b)
+
+        # Weight and bias for the transform gate
+        W_T = va.variable('W_T', shape=[n_inputs, n_units],
+                          regularizer=None, initializer=W_init,
+                          trainable=trainable, restore=restore)
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W_T)
+
+        b_T = va.variable('b_T', shape=[n_units],
+                          initializer=tf.constant_initializer(-1),
+                          trainable=trainable, restore=restore)
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, b_T)
 
         # If input is not 2d, flatten it.
         if len(input_shape) > 2:
@@ -457,12 +536,14 @@ def highway(incoming, n_units, activation='linear',
             activation = activation
         else:
             raise ValueError("Invalid Activation.")
-            
+
         H = activation(tf.matmul(incoming, W) + b)
         T = tf.sigmoid(tf.matmul(incoming, W_T) + b_T)
-        C = tf.sub(1.0, T)
+        if transform_dropout:
+            T = dropout(T, transform_dropout)
+        C = tf.subtract(1.0, T)
 
-        inference = tf.add(tf.mul(H, T), tf.mul(incoming, C))
+        inference = tf.add(tf.multiply(H, T), tf.multiply(incoming, C))
 
         # Track activations.
         tf.add_to_collection(tf.GraphKeys.ACTIVATIONS, inference)
@@ -474,4 +555,125 @@ def highway(incoming, n_units, activation='linear',
     inference.b = b
     inference.b_t = b_T
 
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, inference)
+
     return inference
+
+
+def one_hot_encoding(target, n_classes, on_value=1.0, off_value=0.0,
+                     name="OneHotEncoding"):
+    """ One Hot Encoding.
+
+    Transform numeric labels into a binary vector.
+
+    Input:
+        The Labels Placeholder.
+
+    Output:
+        2-D Tensor, The encoded labels.
+
+    Arguments:
+        target: `Placeholder`. The labels placeholder.
+        n_classes: `int`. Total number of classes.
+        on_value: `scalar`. A scalar defining the on-value.
+        off_value: `scalar`. A scalar defining the off-value.
+        name: A name for this layer (optional). Default: 'OneHotEncoding'.
+
+    """
+
+    with tf.name_scope(name):
+        if target.dtype != dtypes.int64:
+            target = standard_ops.to_int64(target)
+
+        target = standard_ops.one_hot(target, n_classes,
+                                      on_value=on_value,
+                                      off_value=off_value)
+
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, target)
+
+    return target
+
+
+def time_distributed(incoming, fn, args=None, scope=None):
+    """ Time Distributed.
+
+    This layer applies a function to every timestep of the input tensor. The
+    custom function first argument must be the input tensor at every timestep.
+    Additional parameters for the custom function may be specified in 'args'
+    argument (as a list).
+
+    Examples:
+        ```python
+        # Applying a fully_connected layer at every timestep
+        x = time_distributed(input_tensor, fully_connected, [64])
+
+        # Using a conv layer at every timestep with a scope
+        x = time_distributed(input_tensor, conv_2d, [64, 3], scope='tconv')
+        ```
+
+    Input:
+        (3+)-D Tensor [samples, timestep, input_dim].
+
+    Output:
+        (3+)-D Tensor [samples, timestep, output_dim].
+
+    Arguments:
+        incoming: `Tensor`. The incoming tensor.
+        fn: `function`. A function to apply at every timestep. This function
+            first parameter must be the input tensor per timestep. Additional
+            parameters may be specified in 'args' argument.
+        args: `list`. A list of parameters to use with the provided function.
+        scope: `str`. A scope to give to each timestep tensor. Useful when
+            sharing weights. Each timestep tensor scope will be generated
+            as 'scope'-'i' where i represents the timestep id. Note that your
+            custom function will be required to have a 'scope' parameter.
+
+    Returns:
+        A Tensor.
+
+    """
+    if not args: args = list()
+    assert isinstance(args, list), "'args' must be a list."
+
+    if not isinstance(incoming, tf.Tensor):
+        incoming = tf.transpose(tf.stack(incoming), [1, 0, 2])
+
+    input_shape = utils.get_incoming_shape(incoming)
+    timestep = input_shape[1]
+    x = tf.unstack(incoming, axis=1)
+    if scope:
+        x = [fn(x[i], scope=scope+'-'+str(i), *args)
+             for i in range(timestep)]
+    else:
+        x = [fn(x[i], *args) for i in range(timestep)]
+
+    x = list(map(lambda t: tf.reshape(t, [-1, 1]+utils.get_incoming_shape(t)[1:]), x))
+    return tf.concat(x, 1)
+
+
+def multi_target_data(name_list, shape, dtype=tf.float32):
+    """ Multi Target Data.
+
+    Create and concatenate multiple placeholders. To be used when a regression
+    layer uses targets from different sources.
+
+    Arguments:
+        name_list: list of `str`. The names of the target placeholders.
+        shape: list of `int`. The shape of the placeholders.
+        dtype: `tf.type`, Placeholder data type (optional). Default: float32.
+
+    Return:
+        A `Tensor` of the concatenated placeholders.
+
+    """
+    placeholders = []
+    for i in range(len(name_list)):
+        with tf.name_scope(name_list[i]):
+            p = tf.placeholder(shape=shape, dtype=dtype, name='Y')
+        if p not in tf.get_collection(tf.GraphKeys.TARGETS):
+            tf.add_to_collection(tf.GraphKeys.TARGETS, p)
+        placeholders.append(p)
+
+    return tf.concat(placeholders, axis=0)

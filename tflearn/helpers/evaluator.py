@@ -13,7 +13,7 @@ class Evaluator(object):
 
     """ Evaluator.
 
-    A class used for performing predictions or evaluate a model performances.
+    A class used for performing predictions and evaluate a model performance.
 
     Arguments:
         tensors: list of `Tensor`. A list of tensors to perform predictions.
@@ -38,15 +38,15 @@ class Evaluator(object):
     def predict(self, feed_dict):
         """ predict.
 
-        Run data through each tensor's network, and return prediction value.
+        Run data through the provided network and return the result value.
 
         Arguments:
             feed_dict: `dict`. Feed data dictionary, with placeholders as
                 keys, and data as values.
 
         Returns:
-            An `array`. In case of multiple tensors to predict, array is a
-            concatanation of each tensor prediction result.
+            An `array`. In case of multiple tensors to predict, each tensor's
+            prediction result is concatenated.
 
         """
         with self.graph.as_default():
@@ -65,21 +65,23 @@ class Evaluator(object):
             # Prediction for each tensor
             tflearn.is_training(False, self.session)
             prediction = []
-            for output in self.tensors:
-                o_pred = self.session.run(output, feed_dict=feed_dict).tolist()
-                for i, val in enumerate(o_pred): # Reshape pred per sample
-                    if len(self.tensors) > 1:
-                        if not len(prediction) > i: prediction.append([])
-                        prediction[i].append(val)
-                    else:
-                        prediction.append(val)
-            return prediction
+            if len(self.tensors) == 1:
+                return self.session.run(self.tensors[0], feed_dict=feed_dict)
+            else:
+                for output in self.tensors:
+                    o_pred = self.session.run(output, feed_dict=feed_dict).tolist()
+                    for i, val in enumerate(o_pred): # Reshape pred per sample
+                        if len(self.tensors) > 1:
+                            if not len(prediction) > i: prediction.append([])
+                            prediction[i].append(val)
+                return prediction
 
     def evaluate(self, feed_dict, ops, batch_size=128):
         """ Evaluate.
 
-        Evaluate a list of tensors over a whole dataset. It is used to compute
-        a metric mean score over an entire dataset.
+        Evaluate a list of tensors over a whole dataset. Generally,
+        'ops' argument are average performance metrics (such as average mean,
+        top-3, etc...)
 
         Arguments:
             feed_dict: `dict`. The feed dictionary of data.
@@ -87,14 +89,14 @@ class Evaluator(object):
             batch_size: `int`. A batch size.
 
         Returns:
-            The mean average result per tensor over the entire dataset.
+            The mean average result per tensor over all batches.
 
         """
         tflearn.is_training(False, self.session)
         coord = tf.train.Coordinator()
         inputs = tf.get_collection(tf.GraphKeys.INPUTS)
         # Data Preprocessing
-        dprep_dict = []
+        dprep_dict = {}
         dprep_collection = tf.get_collection(tf.GraphKeys.DATA_PREP)
         for i in range(len(inputs)):
             # Support for custom inputs not using dprep/daug

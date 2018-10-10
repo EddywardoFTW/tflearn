@@ -1,20 +1,32 @@
 # -*- coding: utf-8 -*-
 from __future__ import division, print_function, absolute_import
 
+import re
+import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.training import optimizer as tf_optimizer
 
 import tflearn
-from .. import callbacks
+from .. import callbacks as tf_callbacks
 from ..config import init_training_mode
 from ..utils import to_list, id_generator, check_dir_name, standarize_dict, \
     get_dict_first_element, make_batches, slice_array, check_scope_path, \
     check_restore_tensor
 from .. import data_flow
+from .. import variables
+from .. import utils
 
 from .summarizer import summaries, summarize, summarize_gradients, \
     summarize_variables, summarize_activations
+
+# Fix for TF 0.12
+try:
+    writer_summary = tf.summary.FileWriter
+    merge_summary = tf.summary.merge
+except Exception:
+    writer_summary = tf.train.SummaryWriter
+    merge_summary = tf.merge_summary
 
 
 class Trainer(object):
@@ -41,6 +53,8 @@ class Trainer(object):
             ```
         checkpoint_path: `str`. Path to store model checkpoints. If None,
             no model checkpoint will be saved. Default: None.
+        best_checkpoint_path: `str`. Path to store the model when the validation rate reaches its
+            highest point of the current training session and also is above best_val_accuracy. Default: None.
         max_checkpoints: `int` or None. Maximum amount of checkpoints. If
             None, no limit. Default: None.
         keep_checkpoint_every_n_hours: `float`. Number of hours between each
@@ -50,17 +64,22 @@ class Trainer(object):
         session: `Session`. A session for running ops. If None, a new one will
             be created. Note: When providing a session, variables must have been
             initialized already, otherwise an error will be raised.
+        best_val_accuracy: `float` The minimum validation accuracy that needs to be
+            achieved before a model weight's are saved to the best_checkpoint_path. This
+            allows the user to skip early saves and also set a minimum save point when continuing
+            to train a reloaded model. Default: 0.0.
 
     """
 
     def __init__(self, train_ops, graph=None, clip_gradients=5.0,
                  tensorboard_dir="/tmp/tflearn_logs/",
-                 tensorboard_verbose=0, checkpoint_path=None,
+                 tensorboard_verbose=0, checkpoint_path=None, best_checkpoint_path=None,
                  max_checkpoints=None,
                  keep_checkpoint_every_n_hours=10000.0, random_seed=None,
-                 session=None):
+                 session=None, best_val_accuracy=0.0):
 
         self.graph = tf.get_default_graph()
+        self.summ_writer = None
         if graph:
             self.graph = graph
 
@@ -75,16 +94,17 @@ class Trainer(object):
                 tf.set_random_seed(random_seed)
             self.restored = False
             self.tensorboard_dir = check_dir_name(tensorboard_dir)
-            self.training_step = 0
+            self.training_state = TrainingState()
 
             self.train_ops = to_list(train_ops)
             self.validate_trainop_names()
 
-            self.global_loss = None
             self.global_step = tf.Variable(0., name='Global_Step',
                                            trainable=False)
             self.incr_global_step = tf.assign(self.global_step,
                                               tf.add(self.global_step, 1))
+            self.best_val_accuracy = best_val_accuracy
+            self.best_checkpoint_path = best_checkpoint_path
 
             config = None
             tflearn_conf = tf.get_collection(tf.GraphKeys.GRAPH_CONFIG)
@@ -113,26 +133,48 @@ class Trainer(object):
             # Saver for saving a model
             self.saver = tf.train.Saver(
                 max_to_keep=max_checkpoints,
-                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours)
+                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
+                allow_empty=True)
             # Saver for restoring a model (With exclude variable list)
-            all_vars = tf.get_collection(tf.GraphKeys.VARIABLES)
+            all_vars = variables.get_all_variables()
             excl_vars = tf.get_collection(tf.GraphKeys.EXCL_RESTORE_VARS)
             to_restore = [item for item in all_vars
                           if check_restore_tensor(item, excl_vars)]
             self.restorer = tf.train.Saver(
                 var_list=to_restore,
                 max_to_keep=max_checkpoints,
-                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours)
+                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
+                allow_empty=True)
+            # A second Saver, that only restore trainable variables
+            to_restore_trainvars = [item for item in tf.trainable_variables()
+                                    if check_restore_tensor(item, excl_vars)]
+            self.restorer_trainvars = tf.train.Saver(
+                var_list=to_restore_trainvars,
+                max_to_keep=max_checkpoints,
+                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
+                allow_empty=True)
 
+            self.to_restore = to_restore
+            self.to_restore_trainvars = to_restore_trainvars
             self.checkpoint_path = checkpoint_path
 
             if not self.restored:
-                init = tf.initialize_all_variables()
+                # TF 0.12 fix
+                try:
+                    init = tf.group(tf.global_variables_initializer(),
+                                    tf.local_variables_initializer())
+                    self.session.run(tf.variables_initializer(
+                        tf.get_collection_ref('is_training')))
+                except Exception as e:
+                    init = tf.initialize_all_variables()
                 self.session.run(init)
+            # Fix for re-using sessions
+            #initialize_uninit_variables(self.session)
 
     def fit(self, feed_dicts, n_epoch=10, val_feed_dicts=None, show_metric=False,
             snapshot_step=None, snapshot_epoch=True, shuffle_all=None,
-            dprep_dict=None, daug_dict=None, run_id=None):
+            dprep_dict=None, daug_dict=None, excl_trainops=None, run_id=None,
+            callbacks=[]):
         """ fit.
 
         Train network with feeded data dicts.
@@ -171,11 +213,20 @@ class Trainer(object):
                 of every epoch.
             shuffle_all: `bool`. If True, shuffle all data batches (overrides
                 `TrainOp` shuffle parameter behavior).
-            dprep_dict
-            daug_dict
+            dprep_dict: `dict` with `Placeholder` as key and
+                `DataPreprocessing` as value. Apply realtime data
+                preprocessing to the given placeholders (Applied at training
+                and testing time).
+            daug_dict: `dict` with `Placeholder` as key and
+                `DataAugmentation` as value. Apply realtime data
+                augmentation to the given placeholders (Only applied at
+                training time).
+            excl_trainops: `list` of `TrainOp`. A list of train ops to
+                exclude from training process.
             run_id: `str`. A name for the current run. Used for Tensorboard
                 display. If no name provided, a random one will be generated.
-
+            callbacks: `Callback` or `list`. Custom callbacks to use in the
+                training life cycle
         """
 
         if not run_id:
@@ -184,6 +235,11 @@ class Trainer(object):
         print("Run id: " + run_id)
         print("Log directory: " + self.tensorboard_dir)
 
+        original_train_ops = list(self.train_ops)
+        # Remove excluded train_ops
+        if excl_trainops:
+            self.train_ops = list(filter(lambda a: a not in excl_trainops, self.train_ops))
+	    
         # shuffle is an override for simplicty, it will overrides every
         # training op batch shuffling
         if isinstance(shuffle_all, bool):
@@ -191,12 +247,22 @@ class Trainer(object):
 
         with self.graph.as_default():
 
-            try:
-                self.summ_writer = tf.train.SummaryWriter(
-                    self.tensorboard_dir + run_id, self.session.graph)
-            except Exception: # TF 0.7
-                self.summ_writer = tf.train.SummaryWriter(
-                    self.tensorboard_dir + run_id, self.session.graph_def)
+            # TF 0.12 Fix
+            obj_lists = utils.fix_saver()
+            if self.summ_writer:
+                try:
+                    self.summ_writer.reopen()
+                except:
+                    self.summ_writer = writer_summary(
+                        self.tensorboard_dir + run_id, self.session.graph)
+            else:
+                try:
+                    self.summ_writer = writer_summary(
+                        self.tensorboard_dir + run_id, self.session.graph)
+                except Exception: # TF 0.7
+                    self.summ_writer = writer_summary(
+                        self.tensorboard_dir + run_id, self.session.graph_def)
+            utils.fix_saver(obj_lists)
 
             feed_dicts = to_list(feed_dicts)
             for d in feed_dicts: standarize_dict(d)
@@ -205,10 +271,12 @@ class Trainer(object):
                 [standarize_dict(d) for d in val_feed_dicts if not
                  isinstance(d, float)]
 
-            termlogger = callbacks.TermLogger(self.training_step)
-            modelsaver = callbacks.ModelSaver(self.save,
-                                              self.training_step,
+            termlogger = tf_callbacks.TermLogger()
+            modelsaver = tf_callbacks.ModelSaver(self.save,
                                               self.checkpoint_path,
+                                              self.best_checkpoint_path,
+                                              self.best_val_accuracy,
+                                              snapshot_step,
                                               snapshot_epoch)
 
             for i, train_op in enumerate(self.train_ops):
@@ -218,7 +286,7 @@ class Trainer(object):
                                         daug_dict, show_metric,
                                         self.summ_writer, self.coord)
 
-                # Prepare TermLogger for training diplay
+                # Prepare TermLogger for training display
                 metric_term_name = None
                 if train_op.metric is not None:
                     if hasattr(train_op.metric, 'm_name'):
@@ -232,67 +300,99 @@ class Trainer(object):
 
             max_batches_len = np.max([t.n_batches for t in self.train_ops])
 
-            termlogger.on_train_begin()
-            modelsaver.on_epoch_begin()
+            caller = tf_callbacks.ChainCallback(callbacks=[termlogger, modelsaver])
+
+            callbacks = to_list(callbacks)
+
+            if callbacks:
+                [caller.add(cb) for cb in callbacks]
+
+            caller.on_train_begin(self.training_state)
+            train_ops_count = len(self.train_ops)
+            snapshot = snapshot_epoch
 
             try:
                 for epoch in range(n_epoch):
 
-                    termlogger.on_epoch_begin()
-                    modelsaver.on_epoch_begin()
+                    self.training_state.increaseEpoch()
+
+                    caller.on_epoch_begin(self.training_state)
 
                     # Global epoch are defined as loop over all data (whatever
                     # which data input), so one epoch loop in a multi-inputs
                     # model is equal to max(data_input) size.
                     for batch_step in range(max_batches_len):
 
-                        self.training_step += 1
-                        termlogger.on_batch_begin()
-                        modelsaver.on_batch_begin()
+                        self.training_state.increaseStep()
+                        self.training_state.resetGlobal()
 
-                        global_loss, global_acc = 0., 0.
+                        caller.on_batch_begin(self.training_state)
 
                         for i, train_op in enumerate(self.train_ops):
 
-                            termlogger.on_sub_epoch_begin()
-                            modelsaver.on_sub_batch_begin()
+                            caller.on_sub_batch_begin(self.training_state)
 
-                            snapshot = train_op._train(self.training_step,
-                                                       snapshot_epoch,
+                            snapshot = train_op._train(self.training_state.step,
+                                                       (bool(self.best_checkpoint_path) | snapshot_epoch),
                                                        snapshot_step,
                                                        show_metric)
-                            global_loss += train_op.loss_value
-                            if train_op.acc_value and global_acc:
-                                global_acc += train_op.acc_value / len(
-                                    self.train_ops)
-                            else:
-                                global_acc = None
 
-                            data_status = train_op.train_dflow.data_status
+                            # Update training state
+                            self.training_state.update(train_op, train_ops_count)
+
                             # Optimizer batch end
-                            termlogger.on_sub_batch_end(i, data_status.epoch,
-                                                        data_status.current_iter,
-                                                        train_op.loss_value,
-                                                        train_op.acc_value,
-                                                        train_op.val_loss,
-                                                        train_op.val_acc)
-                            modelsaver.on_sub_batch_end()
+                            caller.on_sub_batch_end(self.training_state, i)
 
                         # All optimizers batch end
                         self.session.run(self.incr_global_step)
-                        termlogger.on_batch_end(global_loss, global_acc,
-                                                snapshot)
-                        modelsaver.on_batch_end(snapshot)
+                        caller.on_batch_end(self.training_state, snapshot)
 
                     # Epoch end
-                    termlogger.on_epoch_end()
-                    modelsaver.on_epoch_end()
+                    caller.on_epoch_end(self.training_state)
 
             finally:
-                termlogger.on_train_end()
-                modelsaver.on_train_end()
+                caller.on_train_end(self.training_state)
                 for t in self.train_ops:
                     t.train_dflow.interrupt()
+                # Set back train_ops
+                self.train_ops = original_train_ops
+
+        self.summ_writer.close()
+
+    def fit_batch(self, feed_dicts, dprep_dict=None, daug_dict=None):
+        """ fit_batch.
+
+        Train network with a single batch.
+
+        Arguments:
+            feed_dicts: `dict` or list of `dict`. The dictionary to feed
+                data to the network. It follows Tensorflow feed dict
+                specifications: '{placeholder: data}'. In case of multiple
+                optimizers, a list of dict is expected, that will
+                respectively feed optimizers.
+            dprep_dict: `dict` with `Placeholder` as key and
+                `DataPreprocessing` as value. Apply realtime data
+                preprocessing to the given placeholders (Applied at training
+                and testing time).
+            daug_dict: `dict` with `Placeholder` as key and
+                `DataAugmentation` as value. Apply realtime data
+                augmentation to the given placeholders (Only applied at
+                training time).
+        """
+        feed_dicts = to_list(feed_dicts)
+        for d in feed_dicts: standarize_dict(d)
+        val_loss = []
+        for train_op in self.train_ops:
+            if daug_dict:
+                for k in daug_dict:
+                    feed_dicts[k] = daug_dict.apply(feed_dicts[k])
+            if dprep_dict:
+                for k in dprep_dict:
+                    feed_dicts[k] = dprep_dict.apply(feed_dicts[k])
+        for d in feed_dicts:
+            val_loss.append(train_op._train_batch(d))
+        if len(val_loss) == 1: val_loss = val_loss[0]
+        return val_loss
 
     def save(self, model_file, global_step=None):
         """ save.
@@ -301,70 +401,100 @@ class Trainer(object):
 
         Arguments:
             model_file: `str`. Saving path of tensorflow model
-            global_step: `float`. The training step to append to the
+            global_step: `int`. The training step to append to the
                 model file name (optional).
 
         """
-        # Temp workaround for tensorflow 0.7.0 dict proto serialization issue
-        try:
-            # Try latest api
-            l = tf.get_collection_ref("summary_tags")
-        except Exception:
-            l = tf.get_collection("summary_tags")
-        l_stags = list(l)
-        del l[:]
-
-        try:
-            # Try latest api
-            l1 = tf.get_collection_ref(tf.GraphKeys.DATA_PREP)
-            l2 = tf.get_collection_ref(tf.GraphKeys.DATA_AUG)
-        except Exception:
-            l1 = tf.get_collection(tf.GraphKeys.DATA_PREP)
-            l2 = tf.get_collection(tf.GraphKeys.DATA_AUG)
-        l1_dtags = list(l1)
-        l2_dtags = list(l2)
-        del l1[:]
-        del l2[:]
-
-        try: # Do not save exclude variables
-            l3 = tf.get_collection_ref(tf.GraphKeys.EXCL_RESTORE_VARS)
-        except Exception:
-            l3 = tf.get_collection(tf.GraphKeys.EXCL_RESTORE_VARS)
-        l3_tags = list(l3)
-        del l3[:]
-
-        # Temp workaround for tensorflow 0.7.0 relative path issue
-        if model_file[0] not in ['/', '~']: model_file = './' + model_file
-
+        # Temp workaround for tensorflow 0.7+ dict proto serialization issue
+        obj_lists = utils.fix_saver()
+        # TF 0.12 Fix
+        if not os.path.isabs(model_file):
+            model_file = os.path.abspath(os.path.join(os.getcwd(), model_file))
         self.saver.save(self.session, model_file, global_step=global_step)
+        utils.fix_saver(obj_lists)
 
-        # 0.7 workaround, restore values
-        for t in l_stags:
-            tf.add_to_collection("summary_tags", t)
-        for t in l1_dtags:
-            tf.add_to_collection(tf.GraphKeys.DATA_PREP, t)
-        for t in l2_dtags:
-            tf.add_to_collection(tf.GraphKeys.DATA_AUG, t)
-        for t in l3_tags:
-            tf.add_to_collection(tf.GraphKeys.EXCL_RESTORE_VARS, t)
-
-    def restore(self, model_file):
+    def restore(self, model_file, trainable_variable_only=False, variable_name_map=None, scope_for_restore=None,
+                create_new_session=True, verbose=False):
         """ restore.
 
         Restore a Tensorflow model
 
         Arguments:
             model_file: path of tensorflow model to restore
-
+            trainable_variable_only: If True, only restore trainable variables.
+            variable_name_map: - a (pattern, repl) tuple providing a regular expression pattern
+                                 and replacement, which is applied to variable names, before
+                                 restoration from the model file
+                               - OR, a function map_func, used to perform the mapping, called as:
+                                 name_in_file = map_func(existing_var_op_name)
+                                 The function may return None to indicate a variable is not to be
+                                 restored.
+            scope_for_restore: string specifying the scope to limit to, when restoring variables.
+                               Also removes the scope name prefix from the var name to use when restoring.
+            create_new_session: Set to False if the current session is to be kept.  
+                                Set to True (the default) to create a new session, and re-init all variables.
+            verbose           : Set to True to see a printout of what variables are being restored,
+                                when using scope_for_restore or variable_name_map
+        
         """
-        self.close_session()
-        self.session = tf.Session()
-        self.session.run(tf.initialize_all_variables())
-        self.restorer.restore(self.session, model_file)
+        # TF 0.12 Fix
+        if not os.path.isabs(model_file):
+            model_file = os.path.abspath(os.path.join(os.getcwd(), model_file))
+
+        if create_new_session:
+            self.close_session()
+            config = None
+            tflearn_conf = tf.get_collection(tf.GraphKeys.GRAPH_CONFIG)
+            if tflearn_conf:
+                config = tflearn_conf[0]
+            self.session = tf.Session(config=config)
+            # TF 0.12 Fix
+            try:
+                self.session.run([tf.global_variables_initializer(),
+                                  tf.local_variables_initializer()])
+            except Exception:
+                self.session.run(tf.initialize_all_variables())
+
+        if scope_for_restore is not None:	# allow variables to be restored into a different scope
+            sname = scope_for_restore
+            def vn_map_func(existing_name):		# variable name map function which removes the scope name, e.g.
+                if not existing_name.startswith(sname):  # so that "scope_name/var_name/... is retrieved from var_name/...
+                    return None			# and variables outside of scope_name are not restored
+                name_in_file = re.sub("^%s/" % sname, "", existing_name)
+                if verbose:
+                    print ("[%s] Restoring %s <- %s" % (sname, existing_name, name_in_file))
+                return name_in_file
+            variable_name_map = vn_map_func
+
+        if variable_name_map is not None:	# general-purpose remapping of variable names (name in file vs existing name)
+            if type(variable_name_map)==tuple:	# tuple interpreted as regular expression pattern substitution
+                (pattern, repl) = variable_name_map
+                def vn_map_func(existing_name):
+                    name_in_file = re.sub(pattern, repl, existing_name)
+                    if verbose:
+                        print ("Restoring %s <- %s" % (existing_name, name_in_file))
+                    return name_in_file
+            else:
+                vn_map_func = variable_name_map	# allow arbitrary user-provided mapping function
+            if trainable_variable_only:		# restore either trainingable variables only, or all variables
+                to_restore = self.to_restore_trainvars
+            else:
+                to_restore = self.to_restore
+            renamed_to_restore = {vn_map_func(v.op.name): v for v in to_restore}
+            if None in renamed_to_restore:
+                renamed_to_restore.pop(None)
+            restorer = tf.train.Saver(var_list=renamed_to_restore)
+            restorer.restore(self.session, model_file)
+        elif not trainable_variable_only:
+            self.restorer.restore(self.session, model_file)
+        else:
+            self.restorer_trainvars.restore(self.session, model_file)
         for o in self.train_ops:
             o.session = self.session
         self.restored = True
-        self.training_step = int(self.global_step.eval(self.session))
+
+        # Restore the training step
+        self.training_state.step = int(self.global_step.eval(self.session))
 
     def close_session(self):
         """ Close session """
@@ -418,17 +548,15 @@ class TrainOp(object):
             provided, it will be created. Early defining the step tensor
             might be useful for network creation, such as for learning rate
             decay.
-        input_vars: list of `Variable`. The input data for this training op
-            to be transformed by data augmentation. Default:
-            tf.GraphKeys.INPUTS collection. (optional) Only necessary when
-            using data augmentation.
-        data_preprocessing: A `DataPreprocessing` subclass object to manage
-            real-time data pre-processing when training and predicting (such
-            as zero center data, std normalization...).
-        data_augmentation: `DataAugmentation`. A `DataAugmentation` subclass
-            object to manage real-time data augmentation while training (
-            such as random image crop, random image flip, random sequence
-            reverse...).
+        validation_monitors: `list` of `Tensor` objects.  List of variables
+            to compute during validation, which are also used to produce
+            summaries for output to TensorBoard.  For example, this can be
+            used to periodically record a confusion matrix or AUC metric, 
+            during training.  Each variable should have rank 1, i.e. 
+            shape [None].
+        validation_batch_size: `int` or None. If `int`, specifies the batch
+            size to be used for the validation data feed; otherwise 
+            defaults to being th esame as `batch_size`.
         name: `str`. A name for this class (optional).
         graph: `tf.Graph`. Tensorflow Graph to use for training. Default:
             default tf graph.
@@ -437,6 +565,7 @@ class TrainOp(object):
 
     def __init__(self, loss, optimizer, metric=None, batch_size=64, ema=0.,
                  trainable_vars=None, shuffle=True, step_tensor=None,
+                 validation_monitors=None, validation_batch_size=None,
                  name=None, graph=None):
         self.graph = tf.get_default_graph()
         if graph:
@@ -452,6 +581,9 @@ class TrainOp(object):
         self.metric_summ_name = ""
         if metric is not None:
             self.metric_summ_name = metric.name.split('/')[0]
+        if isinstance(validation_monitors, tf.Tensor):
+            validation_monitors = [validation_monitors]
+        self.validation_monitors = validation_monitors or []
         self.grad = None
         self.apply_grad = None
         self.summ_op = None
@@ -461,6 +593,7 @@ class TrainOp(object):
         self.shuffle = shuffle
 
         self.batch_size = batch_size
+        self.validation_batch_size = validation_batch_size or batch_size
         self.n_batches = 0
 
         self.ema = ema
@@ -515,10 +648,24 @@ class TrainOp(object):
         """
         self.session = session
 
-        # Variables holding mean validation loss and accuracy, assigned after
-        # each model evaluation (by batch). For visualization in Tensorboard.
+        # Variables holding mean validation loss, accuracy, and validation
+        # monitors, assigned after each model evaluation (by batch).
+        # For visualization in Tensorboard.
+        # Define variables, placeholders and assign ops.
         self.val_loss_T = tf.Variable(0., name='val_loss', trainable=False)
         self.val_acc_T = tf.Variable(0., name='val_acc', trainable=False)
+        self.validation_monitors_T = [tf.Variable(0., name='%s_T' % v.name.rsplit(':', 1)[0], trainable=False) for v in self.validation_monitors]
+
+        self.val_loss_P = tf.placeholder(dtype=tf.float32, name='placeholder/%s' % self.val_loss_T.name.rsplit(':')[0])
+        self.val_acc_P = tf.placeholder(dtype=tf.float32, name='placeholder/%s' % self.val_acc_T.name.rsplit(':')[0])
+        self.val_monitors_P = [tf.placeholder(dtype=tf.float32, name='placeholder/%s' % v.name.rsplit(':')[0]) for v in self.validation_monitors_T]
+
+        self.val_loss_assign = tf.assign(self.val_loss_T, self.val_loss_P,
+                                         name='assign/%s' % self.val_loss_T.name.rsplit(':')[0])
+        self.val_acc_assign = tf.assign(self.val_acc_T, self.val_acc_P,
+                                        name='assign/%s' % self.val_acc_T.name.rsplit(':')[0])
+        self.val_monitors_assign = [tf.assign(vmt, vmp, name='assign/%s' % vmt.name.rsplit(':')[0]) for vmt, vmp in
+                                    zip(self.validation_monitors_T, self.val_monitors_P)]
 
         # Creating the accuracy moving average, for better visualization.
         if self.metric is not None:
@@ -636,7 +783,7 @@ class TrainOp(object):
         # every time testing
         if val_feed_dict:
             self.test_dflow = data_flow.FeedDictFlow(val_feed_dict, coord,
-                                                     batch_size=self.batch_size,
+                                                     batch_size=self.validation_batch_size,
                                                      dprep_dict=dprep_dict,
                                                      daug_dict=None,
                                                      index_array=self.val_index_array,
@@ -647,7 +794,9 @@ class TrainOp(object):
 
     def _train(self, training_step, snapshot_epoch, snapshot_step,
                show_metric):
-        """ Training process for this optimizer.
+        """ _train.
+
+        Training process for this optimizer.
 
         Arguments:
             training_step: `int`. The global step.
@@ -668,13 +817,13 @@ class TrainOp(object):
                                              feed_batch)
 
         # Retrieve loss value from summary string
-        sname = "- Loss/" + self.scope_name
+        sname = "Loss/" + self.scope_name
         self.loss_value = summaries.get_value_from_summary_string(
             sname, train_summ_str)
 
         if show_metric and self.metric is not None:
             # Retrieve accuracy value from summary string
-            sname = "- " + self.metric_summ_name + "/" + self.scope_name
+            sname = self.metric_summ_name + "/" + self.scope_name
             self.acc_value = summaries.get_value_from_summary_string(
                 sname, train_summ_str)
 
@@ -691,21 +840,29 @@ class TrainOp(object):
         if snapshot and self.val_feed_dict:
             tflearn.is_training(False, session=self.session)
             # Evaluation returns the mean over all batches.
-            eval_ops = [self.loss]
+            eval_ops = [self.loss] + self.validation_monitors	# compute loss as well as any extra validation monotor tensors
             if show_metric and self.metric is not None:
                 eval_ops.append(self.metric)
             e = evaluate_flow(self.session, eval_ops, self.test_dflow)
             self.val_loss = e[0]
             if show_metric and self.metric is not None:
-                self.val_acc = e[1]
+                self.validation_monitor_values = e[1:-1]
+                self.val_acc = e[-1]
+            else:
+                self.validation_monitor_values = e[1:]
 
             # Set evaluation results to variables, to be summarized.
+            update_val_op = [self.val_loss_assign]
+            update_val_feed = {self.val_loss_P: self.val_loss}
             if show_metric:
-                update_val_op = [tf.assign(self.val_loss_T, self.val_loss),
-                                 tf.assign(self.val_acc_T, self.val_acc)]
-            else:
-                update_val_op = tf.assign(self.val_loss_T, self.val_loss)
-            self.session.run(update_val_op)
+                update_val_op.append(self.val_acc_assign)
+                update_val_feed[self.val_acc_P] = self.val_acc
+            if self.validation_monitors:
+                update_val_op.append(self.val_monitors_assign)
+                for vmp, vmv in zip(self.val_monitors_P, self.validation_monitor_values):
+                    update_val_feed[vmp] = vmv
+
+            self.session.run(update_val_op, feed_dict=update_val_feed)
 
             # Run summary operation.
             test_summ_str = self.session.run(self.val_summary_op)
@@ -722,6 +879,21 @@ class TrainOp(object):
                     test_summ_str, n_step)
 
         return snapshot
+
+    def _train_batch(self, feed_dict):
+        """ _train_batch.
+
+        Train on a single batch.
+
+        Arguments:
+            feed_dict: `dict`. The data dictionary to feed.
+
+        """
+        tflearn.is_training(True, session=self.session)
+        _, loss, _ = self.session.run([self.train, self.loss, self.summ_op],
+                                      feed_dict=feed_dict)
+        tflearn.is_training(False, session=self.session)
+        return loss
 
     def duplicate(self):
         """ Returns a duplicated `TrainOp` """
@@ -747,7 +919,7 @@ class TrainOp(object):
             # Summarize gradients
             summarize_gradients(self.grad, summ_collection)
 
-        self.summ_op = tf.merge_summary(tf.get_collection(summ_collection))
+        self.summ_op = merge_summary(tf.get_collection(summ_collection))
 
     def create_testing_summaries(self, show_metric=False,
                                  metric_name="Accuracy", validation_set=None):
@@ -760,26 +932,34 @@ class TrainOp(object):
 
         if show_metric and self.metric is not None:
             # Summarize Raw Accuracy
-            sname = "- " + mn + "/" + self.scope_name + " (raw)"
+            sname = mn + "/" + self.scope_name + " (raw)"
             summarize(self.metric, "scalar", sname, tr_summ_collection)
             # Summarize Accuracy's moving averages
-            sname = "- " + mn + "/" + self.scope_name
+            sname = mn + "/" + self.scope_name
             self.summ_op = summarize(self.acc_averages.average(self.metric),
                                      "scalar", sname, tr_summ_collection)
 
         if validation_set is not None:
             # Summarive Validation Loss
-            loss_val_name = "- Loss/" + self.scope_name + "/Validation"
+            loss_val_name = "Loss/" + self.scope_name + "/Validation"
             loss_val_name = check_scope_path(loss_val_name)
             self.val_summary_op = summarize(self.val_loss_T, "scalar",
                                             loss_val_name, te_summ_collection)
             if show_metric and self.metric is not None:
                 # Summarize Validation Accuracy
-                acc_val_name = "- " + mn + "/" + self.scope_name + "/Validation"
+                acc_val_name = mn + "/" + self.scope_name + "/Validation"
                 acc_val_name = check_scope_path(acc_val_name)
                 self.val_summary_op = summarize(self.val_acc_T, "scalar",
                                                 acc_val_name,
                                                 te_summ_collection)
+            if self.validation_monitors:
+                # add summaries of additional validation monitor variables
+                for vm_op in self.validation_monitors_T:
+                    vm_name = vm_op.name + "/" + self.scope_name + "/Validation"
+                    vm_name = check_scope_path(vm_name)
+                    self.val_summary_op = summarize(vm_op, "scalar",
+                                                    vm_name,
+                                                    te_summ_collection)
 
 
 def duplicate_identical_ops(ops):
@@ -855,3 +1035,64 @@ def evaluate(session, op_to_evaluate, feed_dict, batch_size):
                     feed_batch[key] = feed_dict[key]
             avg += session.run(op_to_evaluate, feed_batch) / len(batches)
         return avg
+
+
+class TrainingState(object):
+
+    def __init__(self):
+        self.epoch = 0
+        self.step = 0
+        self.current_iter = 0
+        self.step_time = 0.0
+
+        self.acc_value = None
+        self.loss_value = None
+
+        self.val_acc = None
+        self.val_loss = None
+
+        self.best_accuracy = 0.0
+
+        self.global_acc = 0.0
+        self.global_loss = 0.0
+
+    def update(self, train_op, train_ops_count = 1):
+
+        data_status = train_op.train_dflow.data_status
+
+        self.acc_value = train_op.acc_value
+        self.loss_value = train_op.loss_value
+        self.val_acc = train_op.val_acc
+        self.val_loss = train_op.val_loss
+        self.current_iter = data_status.current_iter
+
+        # Update best validation accuracy
+        if self.val_acc is not None and self.val_acc > self.best_accuracy:
+            self.best_accuracy = self.val_acc
+
+        # Update global values
+        self.global_loss += self.loss_value
+
+        if self.acc_value and self.global_acc:
+            self.global_acc += self.acc_value / train_ops_count
+        else:
+            self.global_acc = None
+
+    def increaseEpoch(self):
+        self.epoch += 1
+
+    def increaseStep(self):
+        self.step += 1
+
+    def resetGlobal(self):
+        self.global_acc = 0.0
+        self.global_loss = 0.0
+
+
+# def initialize_uninit_variables(session, list_of_variables=None):
+#     if list_of_variables is None:
+#         list_of_variables = tf.global_variables()
+#     uninitialized_variables = list(tf.get_variable(name) for name in
+#                                    session.run(tf.report_uninitialized_variables(list_of_variables)))
+#     session.run(tf.variables_initializer(uninitialized_variables))
+#     return uninitialized_variables

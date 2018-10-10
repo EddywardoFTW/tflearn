@@ -8,10 +8,11 @@ try:
     import h5py
     H5PY_SUPPORTED = True
 except Exception as e:
-    print("hdf5 not supported (please install/reinstall h5py)")
+    print("hdf5 is not supported on this machine (please install/reinstall h5py for optimal experience)")
     H5PY_SUPPORTED = False
 import numpy as np
 import tensorflow as tf
+from tensorflow.python import pywrap_tensorflow
 
 import tflearn.variables as vs
 
@@ -36,12 +37,33 @@ def get_from_module(identifier, module_params, module_name, instantiate=False, k
 #  Ops utils
 # ------------------
 
+def get_layer_by_name(name_or_scope):
+    """ get_layer.
+
+    Retrieve the output tensor of a layer with the given name or scope.
+
+    Arguments:
+        name_or_scope: `str`. The name (or scope) given to the layer to
+            retrieve.
+
+    Returns:
+        A Tensor.
+
+    """
+    # Track output tensor.
+    c = tf.get_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name_or_scope)
+    if len(c) == 0:
+        raise Exception("No layer found for this name.")
+    if len(c) > 1:
+        return c
+    return c[0]
+
 
 def get_incoming_shape(incoming):
     """ Returns the incoming data shape """
     if isinstance(incoming, tf.Tensor):
         return incoming.get_shape().as_list()
-    elif type(incoming) in [np.array, list, tuple]:
+    elif type(incoming) in [np.array, np.ndarray, list, tuple]:
         return np.shape(incoming)
     else:
         raise Exception("Invalid incoming layer.")
@@ -111,6 +133,22 @@ def get_all_tensor_children(tensor):
         for t in tensor.op.outputs:
             children_list += get_all_tensor_children(t)
     return list(set(children_list))
+
+
+# ---------------
+#   Tensor Utils
+# ---------------
+
+def read_tensor_in_checkpoint(tensor_name, checkpoint_path):
+    try:
+        reader = pywrap_tensorflow.NewCheckpointReader(checkpoint_path)
+        return reader.get_tensor(tensor_name)
+    except Exception as e:  # pylint: disable=broad-except
+        print(str(e))
+        if "corrupted compressed block contents" in str(e):
+            print("It's likely that your checkpoint file has been compressed "
+                  "with SNAPPY.")
+
 
 # ------------------
 #  Other utils
@@ -208,13 +246,10 @@ def feed_dict_builder(X, Y, net_inputs, net_targets):
         # Building feed dictionary
         >> feed_dict = feed_dict_builder(X, Y, input1, output1)
         >> {input1: X, output1: Y}
-
         >> feed_dict = feed_dict_builder({input1: X}, Y, input1, output1)
         >> {input1: X, output1: Y}
-
         >> feed_dict = feed_dict_builder([X1, X2], Y, [in1, in2], out1)
         >> {in1: X1, in2: X2, output1: Y}
-
         # For validation split:
         >> val_feed_dict = feed_dict_builder(0.1, 0.1, input1, output1)
         >> {input1: 0.1, output1: 0.1}
@@ -232,7 +267,6 @@ def feed_dict_builder(X, Y, net_inputs, net_targets):
     Raises:
         Exception if X and net_inputs or Y and net_targets list length doesn't
         match.
-
     """
 
     feed_dict = {}
@@ -244,23 +278,22 @@ def feed_dict_builder(X, Y, net_inputs, net_targets):
             if isinstance(X, float):
                 X = [X for _i in net_inputs]
             elif len(net_inputs) > 1:
-                try: #TODO: Fix brodcast issue if different
+                try:  # TODO: Fix brodcast issue if different
                     if np.ndim(X) < 2:
                         raise ValueError("Multiple inputs but only one data "
                                          "feeded. Please verify number of "
                                          "inputs and data provided match.")
                     elif len(X) != len(net_inputs):
-                        raise Exception(str(len(X)) + " inputs feeded, "
-                                    "but expected: " + str(len(net_inputs)) +
-                                    ". If you are using notebooks, please "
-                                    "make sure that you didn't run graph "
-                                    "construction cell multiple time, "
-                                    "or try to enclose your graph within "
-                                    "`with tf.Graph().as_default():`")
+                        raise Exception(str(len(X)) + " inputs feeded, " +
+                                        "but expected: " + str(len(net_inputs)) +
+                                        ". If you are using notebooks, please "
+                                        "make sure that you didn't run graph "
+                                        "construction cell multiple time, "
+                                        "or try to enclose your graph within "
+                                        "`with tf.Graph().as_default():` or "
+                                        "use `tf.reset_default_graph()`")
                 except Exception:
-                    # Skip verif
                     pass
-
             else:
                 X = [X]
             for i, x in enumerate(X):
@@ -268,11 +301,15 @@ def feed_dict_builder(X, Y, net_inputs, net_targets):
         else:
             # If a dict is provided
             for key, val in X.items():
-                # Do nothing if dict already fits {placeholder: data} template
+                # Copy to feed_dict if dict already fits {placeholder: data} template
                 if isinstance(key, tf.Tensor):
-                    continue
-                else: # Else retrieve placeholder with its name
-                    feed_dict[vs.get_inputs_placeholder_by_name(key)] = val
+                    feed_dict[key] = val
+                else:  # Else retrieve placeholder with its name
+                    var = vs.get_inputs_placeholder_by_name(key)
+                    if var is None:
+                        raise Exception("Feed dict asks for variable named '%s' but no "
+                                        "such variable is known to exist" % key)
+                    feed_dict[var] = val
 
     if not (is_none(Y) or is_none(net_targets)):
         if not isinstance(Y, dict):
@@ -283,14 +320,14 @@ def feed_dict_builder(X, Y, net_inputs, net_targets):
             if isinstance(Y, float):
                 Y = [Y for _t in net_targets]
             elif len(net_targets) > 1:
-                try: #TODO: Fix brodcast issue if different
+                try:  # TODO: Fix brodcast issue if different
                     if np.ndim(Y) < 2:
                         raise ValueError("Multiple outputs but only one data "
                                          "feeded. Please verify number of outputs "
                                          "and data provided match.")
                     elif len(Y) != len(net_targets):
                         raise Exception(str(len(Y)) + " outputs feeded, "
-                                        "but expected: " + str(len(net_targets)))
+                                                      "but expected: " + str(len(net_targets)))
                 except Exception:
                     # skip verif
                     pass
@@ -301,11 +338,15 @@ def feed_dict_builder(X, Y, net_inputs, net_targets):
         else:
             # If a dict is provided
             for key, val in Y.items():
-                # Do nothing if dict already fits {placeholder: data} template
+                # Copy to feed_dict if dict already fits {placeholder: data} template
                 if isinstance(key, tf.Tensor):
-                    continue
-                else: # Else retrieve placeholder with its name
-                    feed_dict[vs.get_targets_placeholder_by_name(key)] = val
+                    feed_dict[key] = val
+                else:  # Else retrieve placeholder with its name
+                    var = vs.get_targets_placeholder_by_name(key)
+                    if var is None:
+                        raise Exception("Feed dict asks for variable named '%s' but no "
+                                        "such variable is known to exist" % key)
+                    feed_dict[var] = val
 
     return feed_dict
 
@@ -349,9 +390,9 @@ def check_restore_tensor(tensor_to_check, exclvars):
 
 # Auto format kernel
 def autoformat_kernel_2d(strides):
-    if type(strides) is int:
+    if isinstance(strides, int):
         return [1, strides, strides, 1]
-    elif type(strides) in [tuple, list]:
+    elif isinstance(strides, (tuple, list, tf.TensorShape)):
         if len(strides) == 2:
             return [1, strides[0], strides[1], 1]
         elif len(strides) == 4:
@@ -366,9 +407,9 @@ def autoformat_kernel_2d(strides):
 # Auto format filter size
 # Output shape: (rows, cols, input_depth, out_depth)
 def autoformat_filter_conv2d(fsize, in_depth, out_depth):
-    if type(fsize) is int:
+    if isinstance(fsize,int):
         return [fsize, fsize, in_depth, out_depth]
-    elif type(fsize) in [tuple, list]:
+    elif isinstance(fsize, (tuple, list, tf.TensorShape)):
         if len(fsize) == 2:
             return [fsize[0], fsize[1], in_depth, out_depth]
         else:
@@ -383,4 +424,158 @@ def autoformat_padding(padding):
     if padding in ['same', 'SAME', 'valid', 'VALID']:
         return str.upper(padding)
     else:
-        raise Exception("Unknow padding! Accepted values: 'same', 'valid'.")
+        raise Exception("Unknown padding! Accepted values: 'same', 'valid'.")
+
+
+# Auto format filter size
+# Output shape: (rows, cols, input_depth, out_depth)
+def autoformat_filter_conv3d(fsize, in_depth, out_depth):
+    if isinstance(fsize, int):
+        return [fsize, fsize, fsize, in_depth, out_depth]
+    elif isinstance(fsize, (tuple, list, tf.TensorShape)):
+        if len(fsize) == 3:
+            return [fsize[0], fsize[1],fsize[2], in_depth, out_depth]
+        else:
+            raise Exception("filter length error: " + str(len(fsize))
+                            + ", only a length of 3 is supported.")
+    else:
+        raise Exception("filter format error: " + str(type(fsize)))
+
+
+# Auto format stride for 3d convolution
+def autoformat_stride_3d(strides):
+    if isinstance(strides, int):
+        return [1, strides, strides, strides, 1]
+    elif isinstance(strides, (tuple, list, tf.TensorShape)):
+        if len(strides) == 3:
+            return [1, strides[0], strides[1],strides[2], 1]
+        elif len(strides) == 5:
+            assert strides[0] == strides[4] == 1, "Must have strides[0] = strides[4] = 1"
+            return [strides[0], strides[1], strides[2], strides[3], strides[4]]
+        else:
+            raise Exception("strides length error: " + str(len(strides))
+                            + ", only a length of 3 or 5 is supported.")
+    else:
+        raise Exception("strides format error: " + str(type(strides)))
+
+
+# Auto format kernel for 3d convolution
+def autoformat_kernel_3d(kernel):
+    if isinstance(kernel, int):
+        return [1, kernel, kernel, kernel, 1]
+    elif isinstance(kernel, (tuple, list, tf.TensorShape)):
+        if len(kernel) == 3:
+            return [1, kernel[0], kernel[1], kernel[2], 1]
+        elif len(kernel) == 5:
+            assert kernel[0] == kernel[4] == 1, "Must have kernel_size[0] = kernel_size[4] = 1"
+            return [kernel[0], kernel[1], kernel[2], kernel[3], kernel[4]]
+        else:
+            raise Exception("kernel length error: " + str(len(kernel))
+                            + ", only a length of 3 or 5 is supported.")
+    else:
+        raise Exception("kernel format error: " + str(type(kernel)))
+
+
+def repeat(inputs, repetitions, layer, *args, **kwargs):
+    outputs = inputs
+    for i in range(repetitions):
+        outputs = layer(outputs, *args, **kwargs)
+    return outputs
+
+
+def fix_saver(collection_lists=None):
+    # Workaround to prevent serialization warning by removing objects
+    if collection_lists is None:
+        try:
+            # Try latest api
+            l = tf.get_collection_ref("summary_tags")
+            l4 = tf.get_collection_ref(tf.GraphKeys.GRAPH_CONFIG)
+        except Exception:
+            l = tf.get_collection("summary_tags")
+            l4 = tf.get_collection(tf.GraphKeys.GRAPH_CONFIG)
+        l_stags = list(l)
+        l4_stags = list(l4)
+        del l[:]
+        del l4[:]
+
+        try:
+            # Try latest api
+            l1 = tf.get_collection_ref(tf.GraphKeys.DATA_PREP)
+            l2 = tf.get_collection_ref(tf.GraphKeys.DATA_AUG)
+        except Exception:
+            l1 = tf.get_collection(tf.GraphKeys.DATA_PREP)
+            l2 = tf.get_collection(tf.GraphKeys.DATA_AUG)
+        l1_dtags = list(l1)
+        l2_dtags = list(l2)
+        del l1[:]
+        del l2[:]
+
+        try: # Do not save exclude variables
+            l3 = tf.get_collection_ref(tf.GraphKeys.EXCL_RESTORE_VARS)
+        except Exception:
+            l3 = tf.get_collection(tf.GraphKeys.EXCL_RESTORE_VARS)
+        l3_tags = list(l3)
+        del l3[:]
+        return [l_stags, l1_dtags, l2_dtags, l3_tags, l4_stags]
+    else:
+        # 0.7+ workaround, restore values
+        for t in collection_lists[0]:
+            tf.add_to_collection("summary_tags", t)
+        for t in collection_lists[4]:
+            tf.add_to_collection(tf.GraphKeys.GRAPH_CONFIG, t)
+        for t in collection_lists[1]:
+            tf.add_to_collection(tf.GraphKeys.DATA_PREP, t)
+        for t in collection_lists[2]:
+            tf.add_to_collection(tf.GraphKeys.DATA_AUG, t)
+        for t in collection_lists[3]:
+            tf.add_to_collection(tf.GraphKeys.EXCL_RESTORE_VARS, t)
+
+
+def validate_func(x, allow_none=True):
+    if not (allow_none and x is None) and hasattr(x, '__call__'):
+        raise ValueError("'%s' must be a function." % x.__name__)
+
+
+def validate_dim(x, max_dim=None, min_dim=None, var_name='var'):
+    # Calculate dimension
+    if isinstance(x, tf.Tensor):
+        dim = len(x.get_shape().as_list())
+    elif type(x) in [np.ndarray, np.array, list]:
+        dim = np.ndim(x)
+    else:
+        #TODO: check hdf5, panda
+        return
+    # Verify dimension conditions
+    if max_dim == min_dim:
+        if dim != max_dim:
+            raise ValueError("%s must be %s-D." % (var_name, max_dim))
+    else:
+        if min_dim and dim < min_dim:
+            raise ValueError(
+                "%s must be at least %s-D." % (var_name, min_dim))
+        elif max_dim and dim > max_dim:
+            raise ValueError(
+                "%s must be %s-D or less." % (var_name, max_dim))
+
+
+def prepare_X(X, target_ndim, max_dim=None, min_dim=None, debug_msg="Data"):
+
+    # Validate the dimension
+    validate_dim(X, max_dim, min_dim)
+
+    X_ndim = np.ndim(X)
+    # Reshape to the desired dimension
+    if X_ndim < target_ndim:
+        for i in range(target_ndim - X_ndim):
+            try:
+                X = np.expand_dims(X, axis=0)
+            except Exception:
+                raise Exception(debug_msg + " shape mismatch (too few dimensions).")
+    elif X_ndim > target_ndim:
+        for i in range(X_ndim - target_ndim):
+            try:
+                X = np.reshape(X, newshape=np.shape(X)[:-1])
+            except Exception:
+                raise Exception(debug_msg +  " shape mismatch (too many dimensions).")
+    return X, X_ndim
+

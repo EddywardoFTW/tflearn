@@ -1,67 +1,112 @@
 from __future__ import division, print_function, absolute_import
 
-import sys, curses
+import time
+import sys
+
+# Verify curses module for Windows and Notebooks Support
 try:
     from IPython.core.display import clear_output
 except:
     pass
 
+CURSES_SUPPORTED = True
+try:
+    import curses
+except Exception:
+    print("curses is not supported on this machine (please install/reinstall curses for an optimal experience)")
+    CURSES_SUPPORTED = False
+
 
 class Callback(object):
     """ Callback base class. """
-
-    def __init__(self, **kwargs):
+    def __init__(self):
         pass
 
-    def on_epoch_begin(self, **kwargs):
+    def on_train_begin(self, training_state):
         pass
 
-    def on_epoch_end(self, **kwargs):
+    def on_epoch_begin(self, training_state):
         pass
 
-    def on_sub_epoch_begin(self, **kwargs):
+    def on_batch_begin(self, training_state):
         pass
 
-    def on_sub_epoch_end(self, **kwargs):
+    def on_sub_batch_begin(self, training_state):
         pass
 
-    def on_batch_begin(self, **kwargs):
+    def on_sub_batch_end(self, training_state, train_index=0):
         pass
 
-    def on_batch_end(self, **kwargs):
+    def on_batch_end(self, training_state, snapshot=False):
         pass
 
-    def on_sub_batch_begin(self, **kwargs):
+    def on_epoch_end(self, training_state):
         pass
 
-    def on_sub_batch_end(self, **kwargs):
+    def on_train_end(self, training_state):
         pass
 
-    def on_train_begin(self, **kwargs):
-        pass
 
-    def on_train_end(self, **kwargs):
-        pass
+class ChainCallback(Callback):
+    def __init__(self, callbacks=[]):
+        self.callbacks = callbacks
+
+    def on_train_begin(self, training_state):
+        for callback in self.callbacks:
+            callback.on_train_begin(training_state)
+
+    def on_epoch_begin(self, training_state):
+        for callback in self.callbacks:
+            callback.on_epoch_begin(training_state)
+
+    def on_batch_begin(self, training_state):
+        for callback in self.callbacks:
+            callback.on_batch_begin(training_state)
+
+    def on_sub_batch_begin(self, training_state):
+        for callback in self.callbacks:
+            callback.on_sub_batch_begin(training_state)
+
+    def on_sub_batch_end(self, training_state, train_index=0):
+        for callback in self.callbacks:
+            callback.on_sub_batch_end(training_state, train_index)
+
+    def on_batch_end(self, training_state, snapshot=False):
+        for callback in self.callbacks:
+            callback.on_batch_end(training_state, snapshot)
+
+    def on_epoch_end(self, training_state):
+        for callback in self.callbacks:
+            callback.on_epoch_end(training_state)
+
+    def on_train_end(self, training_state):
+        for callback in self.callbacks:
+            callback.on_train_end(training_state)
+
+    def add(self, callback):
+        if not isinstance(callback, Callback):
+            raise Exception(str(callback) + " is an invalid Callback object")
+
+        self.callbacks.append(callback)
 
 
 class TermLogger(Callback):
-    def __init__(self, training_step=0):
-        super(TermLogger, self).__init__()
+    def __init__(self):
         self.data = []
-        self.has_curses = True
         self.has_ipython = True
         self.display_type = "multi"
-        self.global_loss = None
-        self.global_acc = None
-        self.global_step = training_step
         self.global_data_size = 0
         self.global_val_data_size = 0
         self.snapped = False
-        try:
-            curses.setupterm()
-            sys.stdout.write(curses.tigetstr('civis').decode())
-        except Exception:
-            self.has_curses = False
+
+        global CURSES_SUPPORTED
+        if CURSES_SUPPORTED:
+            try:
+                curses.setupterm()
+                sys.stdout.write(curses.tigetstr('civis').decode())
+            except Exception:
+                CURSES_SUPPORTED = False
+        
         try:
             clear_output
         except NameError:
@@ -84,43 +129,37 @@ class TermLogger(Callback):
         self.global_data_size += data_size
         self.global_val_data_size += val_size
 
-    def on_epoch_begin(self):
+    def on_epoch_begin(self, training_state):
+        training_state.step_time = time.time()
+        training_state.step_time_total = 0.
+
+    def on_epoch_end(self, training_state):
         pass
 
-    def on_epoch_end(self):
-        pass
+    def on_batch_begin(self, training_state):
+        training_state.step_time = time.time()
 
-    def on_sub_epoch_begin(self):
-        pass
+    def on_batch_end(self, training_state, snapshot=False):
 
-    def on_sub_epoch_end(self, snapshot=False):
+        training_state.step_time_total += time.time() - training_state.step_time
         if snapshot:
-            self.snapshot_termlogs()
+            self.snapshot_termlogs(training_state)
+        else:
+            self.print_termlogs(training_state)
 
-    def on_batch_begin(self):
+    def on_sub_batch_begin(self, training_state):
         pass
 
-    def on_batch_end(self, global_loss=None, global_acc=None, snapshot=False):
-        self.global_step += 1
-        self.global_loss = global_loss
-        self.global_acc = global_acc
-        self.print_termlogs()
-        if snapshot:
-            self.snapshot_termlogs()
+    def on_sub_batch_end(self, training_state, train_index=0):
 
-    def on_sub_batch_start(self):
-        pass
+        self.data[train_index]['loss'] = training_state.loss_value
+        self.data[train_index]['acc'] = training_state.acc_value
+        self.data[train_index]['val_loss'] = training_state.val_loss
+        self.data[train_index]['val_acc'] = training_state.val_acc
+        self.data[train_index]['epoch'] = training_state.epoch
+        self.data[train_index]['step'] = training_state.current_iter
 
-    def on_sub_batch_end(self, train_op_i, epoch, step, loss=None, acc=None,
-                         val_loss=None, val_acc=None):
-        self.data[train_op_i]['loss'] = loss
-        self.data[train_op_i]['acc'] = acc
-        self.data[train_op_i]['val_loss'] = val_loss
-        self.data[train_op_i]['val_acc'] = val_acc
-        self.data[train_op_i]['epoch'] = epoch
-        self.data[train_op_i]['step'] = step
-
-    def on_train_begin(self):
+    def on_train_begin(self, training_state):
         print("---------------------------------")
         print("Training samples: " + str(self.global_data_size))
         print("Validation samples: " + str(self.global_val_data_size))
@@ -128,10 +167,10 @@ class TermLogger(Callback):
         if len(self.data) == 1:
             self.display_type = "single"
 
-    def on_train_end(self):
+    def on_train_end(self, training_state):
         # Reset caret to last position
         to_be_printed = ""
-        if self.has_curses: #if not self.has_ipython #TODO:check bug here
+        if CURSES_SUPPORTED: #if not self.has_ipython #TODO:check bug here
             for i in range(len(self.data) + 2):
                 to_be_printed += "\033[B"
             if not self.snapped:
@@ -139,18 +178,20 @@ class TermLogger(Callback):
         sys.stdout.write(to_be_printed)
         sys.stdout.flush()
 
-        # Set caret visible
-        if self.has_curses:
+        # Set caret visible if possible
+        if CURSES_SUPPORTED:
             sys.stdout.write(curses.tigetstr('cvvis').decode())
 
-    def termlogs(self):
+    def termlogs(self, step=0, global_loss=None, global_acc=None, step_time=None):
 
-        termlogs = "Training Step: " + str(self.global_step) + " "
-        if self.global_loss:
+        termlogs = "Training Step: " + str(step) + " "
+        if global_loss:
             termlogs += " | total loss: \033[1m\033[32m" + \
-                        "%.5f" % self.global_loss + "\033[0m\033[0m"
-        if self.global_acc and not self.display_type == "single":
-            termlogs += " - avg acc: %.4f" % float(self.global_acc)
+                        "%.5f" % global_loss + "\033[0m\033[0m"
+        if global_acc and not self.display_type == "single":
+            termlogs += " - avg acc: %.4f" % float(global_acc)
+        if step_time:
+            termlogs += " | time: %.3fs" % step_time
         termlogs += "\n"
         for i, data in enumerate(self.data):
             print_loss = ""
@@ -184,10 +225,15 @@ class TermLogger(Callback):
 
         return termlogs
 
-    def print_termlogs(self):
+    def print_termlogs(self, training_state):
 
-        termlogs = self.termlogs()
-        if self.has_ipython and not self.has_curses:
+        termlogs = self.termlogs(
+            step=training_state.step,
+            global_loss=training_state.global_loss,
+            global_acc=training_state.global_acc,
+            step_time=training_state.step_time_total)
+
+        if self.has_ipython and not CURSES_SUPPORTED:
             clear_output(wait=True)
         else:
             for i in range(len(self.data) + 1):
@@ -196,9 +242,14 @@ class TermLogger(Callback):
         sys.stdout.write(termlogs)
         sys.stdout.flush()
 
-    def snapshot_termlogs(self):
+    def snapshot_termlogs(self, training_state):
 
-        termlogs = self.termlogs()
+        termlogs = self.termlogs(
+            step=training_state.step,
+            global_loss=training_state.global_loss,
+            global_acc=training_state.global_acc,
+            step_time=training_state.step_time_total)
+
         termlogs += "--\n"
 
         sys.stdout.write(termlogs)
@@ -206,46 +257,53 @@ class TermLogger(Callback):
         self.snapped = True
 
 
-class ModelSaver(object):
-    def __init__(self, save_func, training_step, snapshot_path, snapshot_epoch):
+class ModelSaver(Callback):
+    def __init__(self, save_func, snapshot_path, best_snapshot_path,
+                 best_val_accuracy, snapshot_step, snapshot_epoch):
         self.save_func = save_func
-        self.training_step = training_step
         self.snapshot_path = snapshot_path
         self.snapshot_epoch = snapshot_epoch
+        self.best_snapshot_path = best_snapshot_path
+        self.best_val_accuracy = best_val_accuracy
+        self.snapshot_step = snapshot_step
 
-    def on_epoch_begin(self):
+    def on_epoch_begin(self, training_state):
         pass
 
-    def on_epoch_end(self):
+    def on_epoch_end(self, training_state):
         if self.snapshot_epoch:
-            self.save()
+            self.save(training_state.step)
 
-    def on_sub_epoch_begin(self):
+    def on_batch_begin(self, training_state):
         pass
 
-    def on_sub_epoch_end(self):
+    def on_batch_end(self, training_state, snapshot=False):
+
+        if snapshot & (self.snapshot_step is not None):
+            self.save(training_state.step)
+
+        if None not in (self.best_snapshot_path, self.best_val_accuracy, training_state.val_acc):
+            if training_state.val_acc > self.best_val_accuracy:
+                self.best_val_accuracy = training_state.val_acc
+                self.save_best(int(10000 * round(training_state.val_acc, 4)))
+
+    def on_sub_batch_begin(self, training_state):
         pass
 
-    def on_batch_begin(self):
+    def on_sub_batch_end(self, training_state, train_index=0):
         pass
 
-    def on_batch_end(self, snapshot_model=False):
-        self.training_step += 1
-        if snapshot_model:
-            self.save()
-
-    def on_sub_batch_begin(self):
+    def on_train_begin(self, training_state):
         pass
 
-    def on_sub_batch_end(self):
+    def on_train_end(self, training_state):
         pass
 
-    def on_train_begin(self):
-        pass
-
-    def on_train_end(self):
-        pass
-
-    def save(self):
+    def save(self, training_step=0):
         if self.snapshot_path:
-            self.save_func(self.snapshot_path, self.training_step)
+            self.save_func(self.snapshot_path, training_step)
+
+    def save_best(self, val_accuracy):
+        if self.best_snapshot_path:
+            snapshot_path = self.best_snapshot_path + str(val_accuracy)
+            self.save_func(snapshot_path)
